@@ -48,6 +48,19 @@ def fix_seed(seed):
 
 ### Parse args ###
 parser = argparse.ArgumentParser(description='General Training Pipeline')
+parser.add_argument('--cons_warm', type=int, default=10, help='supervised pre-warm epochs before consistency')
+parser.add_argument('--cons_up', type=int, default=40, help='epochs to linearly warm up consistency weight')
+parser.add_argument('--cons_weight', type=float, default=1.0, help='final consistency weight (alpha)')
+parser.add_argument('--cons_temp', type=float, default=1.0,
+                    help='temperature for probability-based consistency loss')
+parser.add_argument(
+    '--ema_tau',
+    type=float,
+    default=0.99,
+    help='EMA momentum for teacher model in step2'
+)
+
+
 parser_add_main_args(parser)
 args = parser.parse_args()
 parser_add_default_args(args)
@@ -81,6 +94,39 @@ else:
 
 dataset.label = dataset.label.to(device)
 
+# ----------------- DEBUG: label & mask check -----------------
+# place immediately after: dataset.label = dataset.label.to(device)
+try:
+    labels = dataset.label
+    if labels.dim() > 1:
+        labels_squeezed = labels.squeeze(1)
+    else:
+        labels_squeezed = labels
+    unique, counts = torch.unique(labels_squeezed, return_counts=True)
+    print("DEBUG: labels shape:", tuple(labels_squeezed.shape))
+    print("DEBUG: label unique:", unique.tolist())
+    print("DEBUG: label counts:", counts.tolist())
+except Exception as e:
+    print("DEBUG: failed to print labels info:", e)
+
+# If you want to inspect the first split's train_idx counts (after split_idx_lst is created)
+try:
+    if 'split_idx_lst' in locals() and len(split_idx_lst) > 0:
+        sample_split = split_idx_lst[0]
+        if 'train' in sample_split:
+            tr = sample_split['train']
+            # tr may be a tensor of indices or bool mask
+            if isinstance(tr, torch.Tensor):
+                if tr.dtype == torch.bool:
+                    print("DEBUG: sample_split train mask sum:", int(tr.sum().item()))
+                else:
+                    print("DEBUG: sample_split train idx length:", len(tr))
+            else:
+                print("DEBUG: sample_split train type:", type(tr))
+except Exception as e:
+    print("DEBUG: failed to inspect split_idx_lst:", e)
+# -------------------------------------------------------------
+
 n = dataset.graph['num_nodes']
 # infer the number of classes for non one-hot and one-hot labels
 c = max(dataset.label.max().item() + 1, dataset.label.shape[1])
@@ -108,6 +154,12 @@ print(f"num nodes {n} | num classes {c} | num node feats {d}")
 
 ### Load method ###
 model = parse_method(args.method, args, c, d, device)
+
+import copy
+teacher = copy.deepcopy(model)
+for p in teacher.parameters():
+    p.requires_grad = False
+teacher.eval()
 
 # using rocauc as the eval function
 if args.dataset in ('deezer-europe'):
@@ -147,33 +199,129 @@ for run in range(args.runs):
     patience = 0
     for epoch in range(args.epochs):
         start_time = time.perf_counter()
+                # ====== START: S-channel (SimGRACE-style) integration ======
+        # This block replaces the original single-forward -> loss -> backward part.
+        # It performs two stochastic forwards and adds a logits-space MSE consistency loss.
         model.train()
         optimizer.zero_grad()
         emb = None
+
+        # --- hyperparameters for S-channel (use getattr to keep compatibility with args) ---
+        E_warm = getattr(args, "cons_warm", 10)      # pre-warm epochs (only supervised)
+        E_alpha_up = getattr(args, "cons_up", 40)    # epochs to warm up alpha
+        alpha_target = getattr(args, "cons_weight", 1.0)  # final consistency weight (alpha)
+
+        # --- Two stochastic forwards for SimGRACE-style no-augmentation consistency ---
+        # Note: model(dataset) may return different shapes for nodeformer; handle both cases.
         if args.method == 'nodeformer':
-            out, link_loss_ = model(dataset)
+            out1, link_loss1 = model(dataset)
+            out2, link_loss2 = model(dataset)
         else:
-            out = model(dataset)
-        
+            out1 = model(dataset)
+            out2 = model(dataset)
+
+        # For graphormer dataset-specific squeeze handling (mirror original logic)
+        if args.method == 'graphormer':
+            # original code did: out = out.squeeze(0)
+            out1 = out1.squeeze(0)
+            out2 = out2.squeeze(0)
+
+        # --- supervised loss computation (use out1 as supervised prediction to keep original behavior) ---
+        # handle special 'deezer-europe' label formatting as in original code
         if args.dataset in ('deezer-europe'):
             if dataset.label.shape[1] == 1:
-                true_label = F.one_hot(
-                    dataset.label, dataset.label.max() + 1).squeeze(1)
+                true_label = F.one_hot(dataset.label, dataset.label.max() + 1).squeeze(1)
             else:
                 true_label = dataset.label
-            loss = criterion(out[train_idx], true_label.squeeze(1)[
-                train_idx].to(torch.float))
+            # supervised loss expects floats for this dataset (mirror original line)
+            sup_loss = criterion(out1[train_idx], true_label.squeeze(1)[train_idx].to(torch.float))
         else:
-            if args.method == 'graphormer':
-                out = out.squeeze(0)
-            out = F.log_softmax(out, dim=1)
-            loss = criterion(
-                out[train_idx], dataset.label.squeeze(1)[train_idx])
-                
+            out1_logp = F.log_softmax(out1, dim=1)
+            sup_loss = criterion(out1_logp[train_idx], dataset.label.squeeze(1)[train_idx])
+
+        # optional nodeformer special link loss handling: average link losses from two forwards
+        link_loss_avg = None
         if args.method == 'nodeformer':
-            loss -= args.lamda * sum(link_loss_) / len(link_loss_)
+            # ensure shape/format consistent with original expectation (list of values)
+            # combine lists element-wise by averaging if both are lists
+            try:
+                # if link_loss1, link_loss2 are lists
+                link_loss_avg = [(a + b) / 2.0 for a, b in zip(link_loss1, link_loss2)]
+            except Exception:
+                # fallback: if scalar
+                link_loss_avg = [(link_loss1 + link_loss2) / 2.0]
+
+        # --- consistency loss in logits space (more stable than prob space) ---
+        # Use raw logits MSE between the two forward passes (SimGRACE style)
+        # cons_loss = F.mse_loss(out1, out2)
+        # Option A: normalize logits per-node then MSE
+        # out1_n = F.normalize(out1, p=2, dim=1)   # each row normalized
+        # out2_n = F.normalize(out2, p=2, dim=1)
+        # cons_loss = F.mse_loss(out1_n, out2_n)
+        # Option B: probability-space MSE with temperature
+        # T = getattr(args, "cons_temp", 0.5)   # 新增 argparse 参数 --cons_temp
+        # p1 = F.softmax(out1 / T, dim=1)
+        # p2 = F.softmax(out2 / T, dim=1)
+        # cons_loss = F.mse_loss(p1, p2)
+        with torch.no_grad():
+            if args.method == 'nodeformer':
+                t_out, _ = teacher(dataset)
+            else:
+                t_out = teacher(dataset)
+            if args.method == 'graphormer':
+                t_out = t_out.squeeze(0)
+
+        # normalize (或用 softmax as preferred)
+        out1_n = F.normalize(out1, p=2, dim=1)
+        t_out_n = F.normalize(t_out, p=2, dim=1)
+        cons_loss = F.mse_loss(out1_n, t_out_n)
+
+
+        # --- alpha warmup schedule (linear) ---
+        if epoch <= E_warm:
+            alpha = 0.0
+        else:
+            t = epoch - E_warm
+            alpha = alpha_target * min(1.0, float(t) / float(E_alpha_up))
+
+        # --- total loss: supervised + alpha * consistency (and nodeformer link loss subtraction if applicable) ---
+        loss = sup_loss + alpha * cons_loss
+
+        # incorporate nodeformer link loss same way original code did (loss -= args.lamda * mean(link_loss))
+        if args.method == 'nodeformer' and link_loss_avg is not None:
+            # preserve original form: loss -= args.lamda * sum(link_loss_) / len(link_loss_)
+            loss -= args.lamda * sum(link_loss_avg) / max(1, len(link_loss_avg))
+
+        try:
+            sup_val = float(sup_loss.item()) if 'sup_loss' in locals() else float(loss.item())
+        except:
+            sup_val = None
+        try:
+            cons_val = float(cons_loss.item()) if 'cons_loss' in locals() else 0.0
+        except:
+            cons_val = None
+        print(f"[DEBUG] Epoch {epoch:03d} | sup_loss={sup_val:.4f} | cons_loss={cons_val:.4f} | alpha={alpha:.4f} | total_loss={loss.item():.4f}")
+        # Backprop and update
         loss.backward()
+
+        total_grad_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                try:
+                    total_grad_norm += float(p.grad.data.norm(2).item())
+                except:
+                    pass
+        print(f"[DEBUG] Epoch {epoch:03d} | grad_norm={total_grad_norm:.4f}")
+        # gradient clipping to avoid potential explosion when adding extra losses
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
+
+        tau = getattr(args, 'ema_tau', 0.99)
+        for s_param, t_param in zip(model.parameters(), teacher.parameters()):
+            t_param.data.mul_(tau).add_(s_param.data * (1.0 - tau))
+
+        # ====== END: S-channel integration ======
+
         end_time = time.perf_counter()
         run_time = 1000 * (end_time - start_time)
         run_time_list.append(run_time)
