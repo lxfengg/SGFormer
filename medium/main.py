@@ -292,7 +292,7 @@ for run in range(args.runs):
             cons_val = float(cons_loss.item()) if 'cons_loss' in locals() else 0.0
         except:
             cons_val = None
-        print(f"[DEBUG] Epoch {epoch:03d} | sup_loss={sup_val:.4f} | cons_loss={cons_val:.4f} | alpha={alpha:.4f} | total_loss={loss.item():.4f}")
+        # print(f"[DEBUG] Epoch {epoch:03d} | sup_loss={sup_val:.4f} | cons_loss={cons_val:.4f} | alpha={alpha:.4f} | total_loss={loss.item():.4f}")
         # Backprop and update
         loss.backward()
 
@@ -303,7 +303,7 @@ for run in range(args.runs):
                     total_grad_norm += float(p.grad.data.norm(2).item())
                 except:
                     pass
-        print(f"[DEBUG] Epoch {epoch:03d} | grad_norm={total_grad_norm:.4f}")
+        # print(f"[DEBUG] Epoch {epoch:03d} | grad_norm={total_grad_norm:.4f}")
         # gradient clipping to avoid potential explosion when adding extra losses
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
