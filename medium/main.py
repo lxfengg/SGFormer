@@ -60,6 +60,9 @@ parser.add_argument(
     default=0.99,
     help='EMA momentum for teacher model in step2'
 )
+parser.add_argument('--ema_start', type=int, default=10,
+                    help='number of epochs before EMA teacher starts updating')
+
 
 
 parser_add_main_args(parser)
@@ -274,7 +277,7 @@ for run in range(args.runs):
             alpha = 0.0
         else:
             t = epoch - E_warm
-            alpha = alpha_target * min(1.0, float(t) / float(E_alpha_up))
+            alpha = alpha_target * (1 - np.exp(-t / E_alpha_up))  # 指数式 warmup
 
         # --- total loss: supervised + alpha * consistency (and nodeformer link loss subtraction if applicable) ---
         loss = sup_loss + alpha * cons_loss
@@ -305,9 +308,10 @@ for run in range(args.runs):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         optimizer.step()
 
-        tau = getattr(args, 'ema_tau', 0.99)
-        for s_param, t_param in zip(model.parameters(), teacher.parameters()):
-            t_param.data.mul_(tau).add_(s_param.data * (1.0 - tau))
+        if epoch >= args.ema_start:  # EMA teacher 延迟启动
+            tau = getattr(args, 'ema_tau', 0.99)
+            for s_param, t_param in zip(model.parameters(), teacher.parameters()):
+                t_param.data.mul_(tau).add_(s_param.data * (1.0 - tau))
 
         # ====== END: S-channel integration ======
 
