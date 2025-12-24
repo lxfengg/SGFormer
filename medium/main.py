@@ -51,6 +51,7 @@ parser = argparse.ArgumentParser(description='General Training Pipeline')
 parser.add_argument('--cons_warm', type=int, default=10, help='supervised pre-warm epochs before consistency')
 parser.add_argument('--cons_up', type=int, default=40, help='epochs to linearly warm up consistency weight')
 parser.add_argument('--cons_weight', type=float, default=1.0, help='final consistency weight (alpha)')
+# Note: we use normalized logits MSE; temperature is not used in step2
 parser.add_argument('--cons_temp', type=float, default=1.0,
                     help='temperature for probability-based consistency loss')
 parser.add_argument(
@@ -194,6 +195,8 @@ for run in range(args.runs):
         split_idx = split_idx_lst[run]
     train_idx = split_idx['train'].to(device)
     model.reset_parameters()
+    teacher.load_state_dict(model.state_dict())
+    teacher.eval()
 
     best_val = float('-inf')
     patience = 0
@@ -211,20 +214,17 @@ for run in range(args.runs):
         E_alpha_up = getattr(args, "cons_up", 40)    # epochs to warm up alpha
         alpha_target = getattr(args, "cons_weight", 1.0)  # final consistency weight (alpha)
 
-        # --- Two stochastic forwards for SimGRACE-style no-augmentation consistency ---
+        # --- Student forward (single pass) ---
         # Note: model(dataset) may return different shapes for nodeformer; handle both cases.
         if args.method == 'nodeformer':
             out1, link_loss1 = model(dataset)
-            out2, link_loss2 = model(dataset)
         else:
             out1 = model(dataset)
-            out2 = model(dataset)
 
         # For graphormer dataset-specific squeeze handling (mirror original logic)
         if args.method == 'graphormer':
             # original code did: out = out.squeeze(0)
             out1 = out1.squeeze(0)
-            out2 = out2.squeeze(0)
 
         # --- supervised loss computation (use out1 as supervised prediction to keep original behavior) ---
         # handle special 'deezer-europe' label formatting as in original code
@@ -240,16 +240,6 @@ for run in range(args.runs):
             sup_loss = criterion(out1_logp[train_idx], dataset.label.squeeze(1)[train_idx])
 
         # optional nodeformer special link loss handling: average link losses from two forwards
-        link_loss_avg = None
-        if args.method == 'nodeformer':
-            # ensure shape/format consistent with original expectation (list of values)
-            # combine lists element-wise by averaging if both are lists
-            try:
-                # if link_loss1, link_loss2 are lists
-                link_loss_avg = [(a + b) / 2.0 for a, b in zip(link_loss1, link_loss2)]
-            except Exception:
-                # fallback: if scalar
-                link_loss_avg = [(link_loss1 + link_loss2) / 2.0]
 
         # --- consistency loss in logits space (more stable than prob space) ---
         # Use raw logits MSE between the two forward passes (SimGRACE style)
@@ -263,6 +253,8 @@ for run in range(args.runs):
         # p1 = F.softmax(out1 / T, dim=1)
         # p2 = F.softmax(out2 / T, dim=1)
         # cons_loss = F.mse_loss(p1, p2)
+        teacher.eval()
+
         with torch.no_grad():
             if args.method == 'nodeformer':
                 t_out, _ = teacher(dataset)
@@ -288,9 +280,6 @@ for run in range(args.runs):
         loss = sup_loss + alpha * cons_loss
 
         # incorporate nodeformer link loss same way original code did (loss -= args.lamda * mean(link_loss))
-        if args.method == 'nodeformer' and link_loss_avg is not None:
-            # preserve original form: loss -= args.lamda * sum(link_loss_) / len(link_loss_)
-            loss -= args.lamda * sum(link_loss_avg) / max(1, len(link_loss_avg))
 
         try:
             sup_val = float(sup_loss.item()) if 'sup_loss' in locals() else float(loss.item())
