@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from data_utils import class_rand_splits, eval_acc, eval_rocauc, evaluate, load_fixed_splits, class_rand_splits, to_sparse_tensor
+from data_utils import class_rand_splits, eval_acc, eval_rocauc, evaluate, load_fixed_splits, to_sparse_tensor
 from dataset import load_nc_dataset
 from logger import Logger
 from parse import parse_method, parser_add_default_args, parser_add_main_args
@@ -62,6 +62,12 @@ parser.add_argument(
 )
 parser.add_argument('--ema_start', type=int, default=10,
                     help='number of epochs before EMA teacher starts updating')
+# 新增一致性相关开关/选项
+parser.add_argument('--cons_confidence', type=float, default=0.0,
+                    help='min prob threshold for using teacher predictions in consistency (0.0 = no confidence filtering)')
+parser.add_argument('--cons_loss', type=str, default='prob_mse',
+                    choices=['logit_mse', 'prob_mse', 'kl', 'norm_mse'],
+                    help='type of consistency loss to use: logits-MSE, probability-MSE (with temp), KL, or normalized-logits-MSE')
 
 
 
@@ -160,7 +166,9 @@ print(f"num nodes {n} | num classes {c} | num node feats {d}")
 model = parse_method(args.method, args, c, d, device)
 
 import copy
+# --- ensure teacher on same device and frozen ---
 teacher = copy.deepcopy(model)
+teacher.to(device)
 for p in teacher.parameters():
     p.requires_grad = False
 teacher.eval()
@@ -212,52 +220,36 @@ for run in range(args.runs):
         optimizer.zero_grad()
         emb = None
 
-        # --- hyperparameters for S-channel (use getattr to keep compatibility with args) ---
-        E_warm = getattr(args, "cons_warm", 10)      # pre-warm epochs (only supervised)
-        E_alpha_up = getattr(args, "cons_up", 40)    # epochs to warm up alpha
-        alpha_target = getattr(args, "cons_weight", 1.0)  # final consistency weight (alpha)
+        # hyperparams
+        E_warm = getattr(args, "cons_warm", 10)
+        E_alpha_up = getattr(args, "cons_up", 40)
+        alpha_target = getattr(args, "cons_weight", 1.0)
+        T = getattr(args, "cons_temp", 1.0)
+        cons_type = getattr(args, "cons_loss", "prob_mse")
+        conf_thresh = getattr(args, "cons_confidence", 0.0)
 
-        # --- Student forward (single pass) ---
-        # Note: model(dataset) may return different shapes for nodeformer; handle both cases.
+        # Student forward
         if args.method == 'nodeformer':
             out1, link_loss1 = model(dataset)
         else:
             out1 = model(dataset)
 
-        # For graphormer dataset-specific squeeze handling (mirror original logic)
         if args.method == 'graphormer':
-            # original code did: out = out.squeeze(0)
             out1 = out1.squeeze(0)
 
-        # --- supervised loss computation (use out1 as supervised prediction to keep original behavior) ---
-        # handle special 'deezer-europe' label formatting as in original code
+        # supervised loss (unchanged)
         if args.dataset in ('deezer-europe'):
             if dataset.label.shape[1] == 1:
                 true_label = F.one_hot(dataset.label, dataset.label.max() + 1).squeeze(1)
             else:
                 true_label = dataset.label
-            # supervised loss expects floats for this dataset (mirror original line)
             sup_loss = criterion(out1[train_idx], true_label.squeeze(1)[train_idx].to(torch.float))
         else:
             out1_logp = F.log_softmax(out1, dim=1)
             sup_loss = criterion(out1_logp[train_idx], dataset.label.squeeze(1)[train_idx])
 
-        # optional nodeformer special link loss handling: average link losses from two forwards
-
-        # --- consistency loss in logits space (more stable than prob space) ---
-        # Use raw logits MSE between the two forward passes (SimGRACE style)
-        # cons_loss = F.mse_loss(out1, out2)
-        # Option A: normalize logits per-node then MSE
-        # out1_n = F.normalize(out1, p=2, dim=1)   # each row normalized
-        # out2_n = F.normalize(out2, p=2, dim=1)
-        # cons_loss = F.mse_loss(out1_n, out2_n)
-        # Option B: probability-space MSE with temperature
-        # T = getattr(args, "cons_temp", 0.5)   # 新增 argparse 参数 --cons_temp
-        # p1 = F.softmax(out1 / T, dim=1)
-        # p2 = F.softmax(out2 / T, dim=1)
-        # cons_loss = F.mse_loss(p1, p2)
+        # Teacher forward (no grad)
         teacher.eval()
-
         with torch.no_grad():
             if args.method == 'nodeformer':
                 t_out, _ = teacher(dataset)
@@ -266,54 +258,77 @@ for run in range(args.runs):
             if args.method == 'graphormer':
                 t_out = t_out.squeeze(0)
 
-        # normalize (或用 softmax as preferred)
-        out1_n = F.normalize(out1, p=2, dim=1)
-        t_out_n = F.normalize(t_out, p=2, dim=1)
-        cons_loss = F.mse_loss(out1_n, t_out_n)
+        # Prepare mask: unlabeled nodes only (avoid disturbing labeled samples)
+        n_nodes = n
+        unlabeled_mask = torch.ones(n_nodes, dtype=torch.bool, device=device)
+        # train_idx 已经 .to(device) 了，直接用索引屏蔽
+        unlabeled_mask[train_idx] = False
 
 
-        # --- alpha warmup schedule (linear) ---
+        # optionally filter by teacher confidence
+        if conf_thresh > 0.0:
+            # use softmax probabilities of teacher
+            p_t = F.softmax(t_out / T, dim=1)
+            conf_mask = (p_t.max(dim=1).values > conf_thresh)
+            use_mask = unlabeled_mask & conf_mask
+        else:
+            use_mask = unlabeled_mask
+
+        # compute consistency loss according to selected type
+        if use_mask.sum() == 0:
+            cons_loss = torch.tensor(0.0, device=device)
+        else:
+            if cons_type == 'logit_mse':
+                # direct mse on logits (can be large-scale sensitive)
+                cons_loss = F.mse_loss(out1[use_mask], t_out[use_mask])
+            elif cons_type == 'prob_mse':
+                p1 = F.softmax(out1 / T, dim=1)
+                p2 = F.softmax(t_out / T, dim=1)
+                cons_loss = F.mse_loss(p1[use_mask], p2[use_mask])
+            elif cons_type == 'kl':
+                # KL(p_teacher || p_student) with temperature correction
+                logp1 = F.log_softmax(out1 / T, dim=1)
+                p2 = F.softmax(t_out / T, dim=1)
+                cons_loss = F.kl_div(logp1[use_mask], p2[use_mask], reduction='batchmean') * (T * T)
+            else:  # 'norm_mse' normalized logits mse (default fallback)
+                out1_n = F.normalize(out1, p=2, dim=1)
+                t_out_n = F.normalize(t_out, p=2, dim=1)
+                cons_loss = F.mse_loss(out1_n[use_mask], t_out_n[use_mask])
+
+        # alpha warmup (linear)
         if epoch <= E_warm:
             alpha = 0.0
         else:
             t = epoch - E_warm
-            alpha = alpha_target * (1 - np.exp(-t / E_alpha_up))  # 指数式 warmup
+            alpha = alpha_target * min(1.0, float(t) / float(E_alpha_up))
 
-        # --- total loss: supervised + alpha * consistency (and nodeformer link loss subtraction if applicable) ---
+        # total loss
         loss = sup_loss + alpha * cons_loss
 
-        # incorporate nodeformer link loss same way original code did (loss -= args.lamda * mean(link_loss))
+        # optional nodeformer link loss handling as before
+        if args.method == 'nodeformer':
+            # if two values, average them; original code subtracts lamda * mean(link_loss)
+            try:
+                link_loss_avg = [(link_loss1_i) for link_loss1_i in link_loss1]
+                loss -= args.lamda * sum(link_loss_avg) / max(1, len(link_loss_avg))
+            except Exception:
+                pass
 
-        try:
-            sup_val = float(sup_loss.item()) if 'sup_loss' in locals() else float(loss.item())
-        except:
-            sup_val = None
-        try:
-            cons_val = float(cons_loss.item()) if 'cons_loss' in locals() else 0.0
-        except:
-            cons_val = None
-        # print(f"[DEBUG] Epoch {epoch:03d} | sup_loss={sup_val:.4f} | cons_loss={cons_val:.4f} | alpha={alpha:.4f} | total_loss={loss.item():.4f}")
-        # Backprop and update
+        # Backprop
         loss.backward()
 
-        total_grad_norm = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                try:
-                    total_grad_norm += float(p.grad.data.norm(2).item())
-                except:
-                    pass
-        # print(f"[DEBUG] Epoch {epoch:03d} | grad_norm={total_grad_norm:.4f}")
-        # gradient clipping to avoid potential explosion when adding extra losses
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+        # compute grad norm and clip (clip_grad_norm_ returns total_norm)
+        max_norm = 5.0
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+
         optimizer.step()
 
-        if epoch >= args.ema_start:  # EMA teacher 延迟启动
+        # EMA teacher update (delayed by ema_start)
+        if epoch >= getattr(args, 'ema_start', 0):
             tau = getattr(args, 'ema_tau', 0.99)
             for s_param, t_param in zip(model.parameters(), teacher.parameters()):
                 t_param.data.mul_(tau).add_(s_param.data * (1.0 - tau))
-
-        # ====== END: S-channel integration ======
+        # ====== END: S-channel (teacher-student consistency) ======
 
         end_time = time.perf_counter()
         run_time = 1000 * (end_time - start_time)
@@ -332,11 +347,10 @@ for run in range(args.runs):
                 break
 
         if epoch % args.display_step == 0:
-            print(f'Epoch: {epoch:02d}, '
-                  f'Loss: {loss:.4f}, '
-                  f'Train: {100 * result[0]:.2f}%, '
-                  f'Valid: {100 * result[1]:.2f}%, '
-                  f'Test: {100 * result[2]:.2f}%')
+            mask_count = int(use_mask.sum().item()) if 'use_mask' in locals() else -1
+            grad_norm_val = float(grad_norm) if 'grad_norm' in locals() else -1.0
+            print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}, Train: {100 * result[0]:.2f}%, Valid: {100 * result[1]:.2f}%, Test: {100 * result[2]:.2f}%, cons_nodes:{mask_count}, grad_norm:{grad_norm_val:.4f}')
+
     logger.print_statistics(run)
 
 run_time = sum(run_time_list) / len(run_time_list)
