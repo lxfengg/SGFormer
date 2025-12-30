@@ -1,43 +1,71 @@
 #!/usr/bin/env bash
-# run_exps.sh - run baseline and two S-channel configs, save logs
+set -e
 
-mkdir -p logs
+############################
+# 基本路径配置（只做变量替换）
+############################
+ROOT_DIR=/mnt/d/File/code/SGFormer
+DATA_DIR=${ROOT_DIR}/data
+MEDIUM_DIR=${ROOT_DIR}/medium
+LOG_DIR=${MEDIUM_DIR}/logs
 
-# 1) Baseline: pure supervised
-echo "Running baseline supervised..."
-python main.py \
-  --dataset cora \
-  --method ours \
-  --epochs 40 \
-  --cpu \
-  --data_dir /mnt/d/File/code/SGFormer/data/ \
-  --cons_weight 0.0 \
-  --display_step 5 2>&1 | tee logs/baseline_supervised.log
+PY=python
+MAIN_PY=${MEDIUM_DIR}/main.py
 
-# 2) Small-cons: conservative S-channel (long warmup, tiny weight)
-echo "Running small-cons S-channel..."
-python main.py \
-  --dataset cora \
-  --method ours \
-  --epochs 60 \
-  --cpu \
-  --data_dir /mnt/d/File/code/SGFormer/data/ \
-  --cons_warm 30 \
+mkdir -p ${LOG_DIR}
+
+echo "[INFO] ROOT_DIR=${ROOT_DIR}"
+echo "[INFO] DATA_DIR=${DATA_DIR}"
+echo "[INFO] MAIN_PY=${MAIN_PY}"
+echo "[INFO] LOG_DIR=${LOG_DIR}"
+
+############################
+# 通用参数（A / B 共用）
+############################
+COMMON_ARGS="
+  --dataset cora
+  --method ours
+  --epochs 1200
+  --runs 10
+  --patience 400
+  --cpu
+  --data_dir ${DATA_DIR}
+  --display_step 50
+"
+
+############################
+# ========== A 方案 ==========
+# Baseline（等价于你之前“直接 python main.py 能跑”的方式）
+############################
+echo "======================================"
+echo "[RUN A] Baseline (no consistency)"
+echo "======================================"
+
+${PY} ${MAIN_PY} \
+  ${COMMON_ARGS} \
+  --cons_warm 0 \
+  --cons_up 0 \
+  --cons_weight 0 \
+  2>&1 | tee ${LOG_DIR}/A_baseline.log
+
+############################
+# ========== B 方案 ==========
+# S-channel + EMA teacher（一致性训练）
+############################
+echo "======================================"
+echo "[RUN B] S-channel + EMA consistency"
+echo "======================================"
+
+${PY} ${MAIN_PY} \
+  ${COMMON_ARGS} \
+  --cons_warm 20 \
   --cons_up 60 \
   --cons_weight 0.05 \
-  --display_step 5 2>&1 | tee logs/small_cons.log
+  --cons_loss prob_mse \
+  --cons_temp 1.0 \
+  --ema_start 10 \
+  --ema_tau 0.99 \
+  --cons_confidence 0.0 \
+  2>&1 | tee ${LOG_DIR}/B_s_channel_w0.05.log
 
-# 3) Long-cons: more aggressive S-channel (after sanity)
-echo "Running long-cons S-channel..."
-python main.py \
-  --dataset cora \
-  --method ours \
-  --epochs 200 \
-  --cpu \
-  --data_dir /mnt/d/File/code/SGFormer/data/ \
-  --cons_warm 10 \
-  --cons_up 40 \
-  --cons_weight 0.5 \
-  --display_step 10 2>&1 | tee logs/long_cons.log
-
-echo "All experiments completed. Logs in logs/"
+echo "[INFO] All experiments finished."

@@ -122,33 +122,81 @@ def load_deezer_dataset():
 
 
 def load_planetoid_dataset(name, no_feat_norm=False):
-    if not no_feat_norm:
-        transform = T.NormalizeFeatures()
-        torch_dataset = Planetoid(root=f'{DATAPATH}Planetoid',
-                                  name=name, transform=transform)
-    else:
-        torch_dataset = Planetoid(root=f'{DATAPATH}Planetoid', name=name)
-    data = torch_dataset[0]
+    """
+    Load Planetoid dataset from local raw files only (NO downloading).
+    Expect files under:
+    DATAPATH/Planetoid/raw/ind.{name}.*
+    """
 
-    edge_index = data.edge_index
-    node_feat = data.x
-    label = data.y
-    num_nodes = data.num_nodes
-    print(f"Num nodes: {num_nodes}")
+    raw_dir = os.path.join(DATAPATH, 'Planetoid', 'raw')
+
+    def load_file(fname):
+        with open(os.path.join(raw_dir, fname), 'rb') as f:
+            return pkl.load(f, encoding='latin1')
+
+    x = load_file(f'ind.{name}.x')
+    y = load_file(f'ind.{name}.y')
+    tx = load_file(f'ind.{name}.tx')
+    ty = load_file(f'ind.{name}.ty')
+    allx = load_file(f'ind.{name}.allx')
+    ally = load_file(f'ind.{name}.ally')
+    graph = load_file(f'ind.{name}.graph')
+
+    test_idx = np.loadtxt(
+        os.path.join(raw_dir, f'ind.{name}.test.index'),
+        dtype=np.int64
+    )
+
+    # ===== features =====
+    features = sp.vstack((allx, tx)).tolil()
+    features[test_idx, :] = features[
+        range(allx.shape[0], allx.shape[0] + tx.shape[0]), :
+    ]
+    features = torch.FloatTensor(features.toarray())
+
+    if not no_feat_norm:
+        features = normalize_feat(features)
+        features = torch.FloatTensor(features)
+
+    # ===== labels =====
+    labels = np.vstack((ally, ty))
+    labels[test_idx, :] = labels[
+        range(ally.shape[0], ally.shape[0] + ty.shape[0]), :
+    ]
+    labels = torch.LongTensor(labels.argmax(axis=1))
+
+    # ===== edges =====
+    edge_list = []
+    for src, dsts in graph.items():
+        for dst in dsts:
+            edge_list.append([src, dst])
+    edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
+
+    num_nodes = features.size(0)
+    print(f'Num nodes: {num_nodes}')
 
     dataset = NCDataset(name)
 
-    dataset.train_idx = torch.where(data.train_mask)[0]
-    dataset.valid_idx = torch.where(data.val_mask)[0]
-    dataset.test_idx = torch.where(data.test_mask)[0]
+    # ===== 核心修复：补齐固定划分 =====
+    train_idx = torch.arange(y.shape[0], dtype=torch.long)
+    valid_idx = torch.arange(y.shape[0], y.shape[0] + 500, dtype=torch.long)
+    test_idx = torch.from_numpy(test_idx).long()
 
-    dataset.graph = {'edge_index': edge_index,
-                     'node_feat': node_feat,
-                     'edge_feat': None,
-                     'num_nodes': num_nodes}
-    dataset.label = label
+    dataset.train_idx = train_idx
+    dataset.valid_idx = valid_idx
+    dataset.test_idx = test_idx
+
+    dataset.graph = {
+        'edge_index': edge_index,
+        'node_feat': features,
+        'edge_feat': None,
+        'num_nodes': num_nodes
+    }
+    dataset.label = labels
 
     return dataset
+
+
 
 def load_geom_gcn_dataset(name):
     # graph_adjacency_list_file_path = '../../data/geom-gcn/{}/out1_graph_edges.txt'.format(

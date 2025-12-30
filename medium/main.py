@@ -68,8 +68,13 @@ parser.add_argument('--cons_confidence', type=float, default=0.0,
 parser.add_argument('--cons_loss', type=str, default='prob_mse',
                     choices=['logit_mse', 'prob_mse', 'kl', 'norm_mse'],
                     help='type of consistency loss to use: logits-MSE, probability-MSE (with temp), KL, or normalized-logits-MSE')
-
-
+# optional node selection limits
+parser.add_argument('--cons_max_nodes', type=int, default=0,
+                    help='max number of unlabeled nodes to use for consistency (0 = use all candidates)')
+parser.add_argument('--cons_ratio', type=float, default=0.0,
+                    help='ratio (0-1) of unlabeled candidates to use (if >0 overrides cons_max_nodes)')
+parser.add_argument('--cons_conf_gamma', type=float, default=1.0,
+                    help='gamma exponent for confidence weighting (w = conf^gamma)')
 
 parser_add_main_args(parser)
 args = parser.parse_args()
@@ -198,7 +203,8 @@ else:
         model.parameters(), weight_decay=args.weight_decay, lr=args.lr)
 
 run_time_list = []
-
+best_val = float('-inf')
+best_val_test = 0.0
 for run in range(args.runs):
     if args.dataset in ['cora', 'citeseer', 'pubmed'] and args.protocol == 'semi':
         split_idx = split_idx_lst[0]
@@ -213,7 +219,7 @@ for run in range(args.runs):
     patience = 0
     for epoch in range(args.epochs):
         start_time = time.perf_counter()
-                # ====== START: S-channel (SimGRACE-style) integration ======
+        # ====== START: S-channel (SimGRACE-style) integration ======
         # This block replaces the original single-forward -> loss -> backward part.
         # It performs two stochastic forwards and adds a logits-space MSE consistency loss.
         model.train()
@@ -227,6 +233,9 @@ for run in range(args.runs):
         T = getattr(args, "cons_temp", 1.0)
         cons_type = getattr(args, "cons_loss", "prob_mse")
         conf_thresh = getattr(args, "cons_confidence", 0.0)
+        cons_max_nodes = getattr(args, "cons_max_nodes", 0)
+        cons_ratio = getattr(args, "cons_ratio", 0.0)
+        cons_gamma = getattr(args, "cons_conf_gamma", 1.0)
 
         # Student forward
         if args.method == 'nodeformer':
@@ -264,46 +273,95 @@ for run in range(args.runs):
         # train_idx 已经 .to(device) 了，直接用索引屏蔽
         unlabeled_mask[train_idx] = False
 
-
-        # optionally filter by teacher confidence
+        # optionally filter by teacher confidence (initial coarse filter)
         if conf_thresh > 0.0:
             # use softmax probabilities of teacher
-            p_t = F.softmax(t_out / T, dim=1)
-            conf_mask = (p_t.max(dim=1).values > conf_thresh)
-            use_mask = unlabeled_mask & conf_mask
+            p_t_full = F.softmax(t_out / T, dim=1)
+            conf_mask_full = (p_t_full.max(dim=1).values > conf_thresh)
+            candidates_mask = unlabeled_mask & conf_mask_full
         else:
-            use_mask = unlabeled_mask
+            candidates_mask = unlabeled_mask
 
-        # compute consistency loss according to selected type
+        # If requested, restrict to top-k or top-ratio of candidates by teacher confidence
+        # compute teacher probabilities and confidences
+        p_t_all = F.softmax(t_out / T, dim=1)
+        max_conf_all = p_t_all.max(dim=1).values  # per-node max prob
+
+        # Build ordered candidate indices by confidence descending
+        cand_idx = torch.where(candidates_mask)[0]
+        if cand_idx.numel() == 0:
+            # no candidates -> set use_mask empty
+            use_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
+        else:
+            if cons_ratio > 0.0 and 0.0 < cons_ratio <= 1.0:
+                k = max(1, int(cons_ratio * cand_idx.numel()))
+                # sort candidate indices by confidence
+                conf_vals = max_conf_all[cand_idx]
+                _, order = torch.sort(conf_vals, descending=True)
+                selected = cand_idx[order[:k]]
+                use_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
+                use_mask[selected] = True
+            elif cons_max_nodes > 0:
+                k = min(cons_max_nodes, cand_idx.numel())
+                conf_vals = max_conf_all[cand_idx]
+                _, order = torch.sort(conf_vals, descending=True)
+                selected = cand_idx[order[:k]]
+                use_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
+                use_mask[selected] = True
+            else:
+                # use all candidates
+                use_mask = candidates_mask
+
+        # compute consistency loss according to selected type with confidence weighting
+        p_t = p_t_all  # teacher probabilities
+        max_conf = max_conf_all  # teacher confidences
+
         if use_mask.sum() == 0:
             cons_loss = torch.tensor(0.0, device=device)
+            cons_nodes = 0
+            mean_teacher_conf = float(max_conf.mean().item()) if max_conf.numel() > 0 else 0.0
         else:
+            cons_nodes = int(use_mask.sum().item())
+            idx = torch.where(use_mask)[0]  # selected node indices
+
+            # compute weight per node based on teacher confidence
+            w_raw = max_conf[idx].clamp(min=1e-12) ** cons_gamma  # avoid zero
+            # normalize weights to sum=1 for stability
+            w = w_raw / (w_raw.sum() + 1e-12)
+
+            # compute per-node error based on chosen cons_type
             if cons_type == 'logit_mse':
-                # direct mse on logits (can be large-scale sensitive)
-                cons_loss = F.mse_loss(out1[use_mask], t_out[use_mask])
+                per_node_err = ((out1[idx] - t_out[idx]) ** 2).sum(dim=1)  # (k,)
+                cons_loss = (w * per_node_err).sum()
             elif cons_type == 'prob_mse':
                 p1 = F.softmax(out1 / T, dim=1)
-                p2 = F.softmax(t_out / T, dim=1)
-                cons_loss = F.mse_loss(p1[use_mask], p2[use_mask])
+                per_node_err = ((p1[idx] - p_t[idx]) ** 2).sum(dim=1)
+                cons_loss = (w * per_node_err).sum()
             elif cons_type == 'kl':
-                # KL(p_teacher || p_student) with temperature correction
+                # per-node KL (p_teacher || p_student) with temperature correction
                 logp1 = F.log_softmax(out1 / T, dim=1)
-                p2 = F.softmax(t_out / T, dim=1)
-                cons_loss = F.kl_div(logp1[use_mask], p2[use_mask], reduction='batchmean') * (T * T)
-            else:  # 'norm_mse' normalized logits mse (default fallback)
+                p2 = p_t[idx]
+                logp1_idx = logp1[idx]
+                per_node_kl = (p2 * (torch.log(p2 + 1e-12) - logp1_idx)).sum(dim=1)
+                cons_loss = (w * per_node_kl).sum() * (T * T)
+            else:  # 'norm_mse' fallback
                 out1_n = F.normalize(out1, p=2, dim=1)
                 t_out_n = F.normalize(t_out, p=2, dim=1)
-                cons_loss = F.mse_loss(out1_n[use_mask], t_out_n[use_mask])
+                per_node_err = ((out1_n[idx] - t_out_n[idx]) ** 2).sum(dim=1)
+                cons_loss = (w * per_node_err).sum()
 
-        # alpha warmup (linear)
-        if epoch <= E_warm:
-            alpha = 0.0
+            # compute mean teacher confidence on selected nodes for logging
+            mean_teacher_conf = float(max_conf[idx].mean().item())
+
+        # alpha warmup (linear). NOTE: warm period: epoch < E_warm -> alpha=0
+        if epoch < E_warm:
+            curr_cons_weight = 0.0
         else:
             t = epoch - E_warm
-            alpha = alpha_target * min(1.0, float(t) / float(E_alpha_up))
+            curr_cons_weight = alpha_target * min(1.0, float(t) / float(E_alpha_up))
 
         # total loss
-        loss = sup_loss + alpha * cons_loss
+        loss = sup_loss + curr_cons_weight * cons_loss
 
         # optional nodeformer link loss handling as before
         if args.method == 'nodeformer':
@@ -323,8 +381,8 @@ for run in range(args.runs):
 
         optimizer.step()
 
-        # EMA teacher update (delayed by ema_start)
-        if epoch >= getattr(args, 'ema_start', 0):
+        # EMA teacher update: only update when epoch >= ema_start AND consistency weight > 0
+        if epoch >= getattr(args, 'ema_start', 0) and curr_cons_weight > 0.0:
             tau = getattr(args, 'ema_tau', 0.99)
             for s_param, t_param in zip(model.parameters(), teacher.parameters()):
                 t_param.data.mul_(tau).add_(s_param.data * (1.0 - tau))
@@ -340,6 +398,7 @@ for run in range(args.runs):
 
         if result[1] > best_val:
             best_val = result[1]
+            best_val_test = result[2]
             patience = 0
         else:
             patience += 1
@@ -349,11 +408,22 @@ for run in range(args.runs):
         if epoch % args.display_step == 0:
             mask_count = int(use_mask.sum().item()) if 'use_mask' in locals() else -1
             grad_norm_val = float(grad_norm) if 'grad_norm' in locals() else -1.0
-            print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}, Train: {100 * result[0]:.2f}%, Valid: {100 * result[1]:.2f}%, Test: {100 * result[2]:.2f}%, cons_nodes:{mask_count}, grad_norm:{grad_norm_val:.4f}')
+            # print more info: curr_cons_weight and mean_teacher_conf
+            mtc = mean_teacher_conf if 'mean_teacher_conf' in locals() else 0.0
+            print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}, Train: {100 * result[0]:.2f}%, Valid: {100 * result[1]:.2f}%, Test: {100 * result[2]:.2f}%, cons_nodes:{mask_count}, curr_cons_weight:{curr_cons_weight:.4f}, mean_teacher_conf:{mtc:.4f}, grad_norm:{grad_norm_val:.4f}')
 
     logger.print_statistics(run)
+    # 追加到CSV: columns = run, best_val, best_test
+    csv_path = os.path.join('results', f'{args.dataset}_{args.method}_results_per_run.csv')
+    os.makedirs('results', exist_ok=True)
+    # append header if file not exists
+    if not os.path.exists(csv_path):
+        with open(csv_path, 'w') as _f:
+            _f.write('run,best_val,best_test\n')
+    with open(csv_path, 'a') as _f:
+        _f.write(f'{run},{best_val:.6f},{best_val_test:.6f}\n')
 
-run_time = sum(run_time_list) / len(run_time_list)
+run_time = sum(run_time_list) / len(run_time_list) if len(run_time_list) > 0 else 0.0
 results = logger.print_statistics()
 print(results)
 out_folder = 'results'
