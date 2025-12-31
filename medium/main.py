@@ -1,15 +1,18 @@
+#!/usr/bin/env python3
 import argparse
 import copy
 import os
 import random
 import sys
 import warnings
-import time, subprocess
+import time
+import subprocess
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from data_utils import class_rand_splits, eval_acc, eval_rocauc, evaluate, load_fixed_splits, to_sparse_tensor
 from dataset import load_nc_dataset
 from logger import Logger
@@ -19,24 +22,18 @@ from torch_geometric.utils import (add_self_loops, remove_self_loops,
 
 warnings.filterwarnings('ignore')
 
-# NOTE: for consistent data splits, see data_utils.rand_train_test_idx
+
 def get_gpu_memory_map():
-    """Get the current gpu usage.
-    Returns
-    -------
-    usage: dict
-        Keys are device ids as integers.
-        Values are memory usage as integers in MB.
-    """
-    result = subprocess.check_output(
-        [
-            'nvidia-smi', '--query-gpu=memory.used',
-            '--format=csv,nounits,noheader'
-        ], encoding='utf-8')
-    # Convert lines into a dictionary
-    gpu_memory = np.array([int(x) for x in result.strip().split('\n')])
-    # gpu_memory_map = dict(zip(range(len(gpu_memory)), gpu_memory))
-    return gpu_memory
+    """Get the current gpu usage (MB) as numpy array."""
+    try:
+        result = subprocess.check_output(
+            ['nvidia-smi', '--query-gpu=memory.used', '--format=csv,nounits,noheader'],
+            encoding='utf-8')
+        gpu_memory = np.array([int(x) for x in result.strip().split('\n')])
+        return gpu_memory
+    except Exception:
+        return np.array([])
+
 
 def fix_seed(seed):
     random.seed(seed)
@@ -46,48 +43,67 @@ def fix_seed(seed):
     torch.backends.cudnn.deterministic = True
 
 
+def resolve_data_dir(data_dir):
+    """Try to robustly find the Planetoid/raw directory given a user-provided data_dir.
+    We try a few likely relative locations to avoid FileNotFoundError in common setups.
+    Returns the found data_dir (or original if none found). Prints info.
+    """
+    candidates = [data_dir,
+                  os.path.join(os.getcwd(), data_dir),
+                  os.path.abspath(data_dir),
+                  os.path.join(os.getcwd(), '..', 'data'),
+                  os.path.join(os.getcwd(), '..', '..', 'data'),
+                  os.path.join(os.getcwd(), 'data'),
+                  os.path.join('/mnt', 'd', 'File', 'code', 'SGFormer', 'data'),
+                  os.path.join(os.path.dirname(__file__), '..', 'data') if '__file__' in globals() else None]
+    checked = []
+    for c in candidates:
+        if c is None:
+            continue
+        if os.path.exists(c):
+            # check Planetoid/raw contents
+            raw = os.path.join(c, 'Planetoid', 'raw')
+            if os.path.exists(raw):
+                # exist - accept this
+                print(f"[INFO] Using data_dir = {c} (found Planetoid/raw).")
+                return c
+        checked.append(c)
+    # fallback: just return original but warn
+    print("[WARN] Could not find 'Planetoid/raw' under tried locations. Tried:", checked)
+    print("[WARN] Will proceed with provided data_dir; if dataset loader fails, please set correct --data_dir")
+    return data_dir
+
+
 ### Parse args ###
 parser = argparse.ArgumentParser(description='General Training Pipeline')
 parser.add_argument('--cons_warm', type=int, default=10, help='supervised pre-warm epochs before consistency')
 parser.add_argument('--cons_up', type=int, default=40, help='epochs to linearly warm up consistency weight')
 parser.add_argument('--cons_weight', type=float, default=1.0, help='final consistency weight (alpha)')
-# Note: we use normalized logits MSE; temperature is not used in step2
 parser.add_argument('--cons_temp', type=float, default=1.0,
                     help='temperature for probability-based consistency loss')
-parser.add_argument(
-    '--ema_tau',
-    type=float,
-    default=0.99,
-    help='EMA momentum for teacher model in step2'
-)
-parser.add_argument('--ema_start', type=int, default=10,
-                    help='number of epochs before EMA teacher starts updating')
-# 新增一致性相关开关/选项
+parser.add_argument('--ema_tau', type=float, default=0.99, help='EMA momentum for teacher model in step2')
+parser.add_argument('--ema_start', type=int, default=10, help='number of epochs before EMA teacher starts updating')
 parser.add_argument('--cons_confidence', type=float, default=0.0,
                     help='min prob threshold for using teacher predictions in consistency (0.0 = no confidence filtering)')
 parser.add_argument('--cons_loss', type=str, default='prob_mse',
                     choices=['logit_mse', 'prob_mse', 'kl', 'norm_mse'],
                     help='type of consistency loss to use: logits-MSE, probability-MSE (with temp), KL, or normalized-logits-MSE')
-# optional node selection limits
-parser.add_argument('--cons_max_nodes', type=int, default=0,
-                    help='max number of unlabeled nodes to use for consistency (0 = use all candidates)')
-parser.add_argument('--cons_ratio', type=float, default=0.0,
-                    help='ratio (0-1) of unlabeled candidates to use (if >0 overrides cons_max_nodes)')
-parser.add_argument('--cons_conf_gamma', type=float, default=1.0,
-                    help='gamma exponent for confidence weighting (w = conf^gamma)')
-
+# main args from parse.py helper
 parser_add_main_args(parser)
 args = parser.parse_args()
 parser_add_default_args(args)
 print(args)
 
+# Fix seed and device
 fix_seed(args.seed)
-
 if args.cpu:
     device = torch.device("cpu")
 else:
-    device = torch.device("cuda:" + str(args.device)
-                          ) if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device("cuda:" + str(args.device)) if torch.cuda.is_available() else torch.device("cpu")
+print("[INFO] device:", device)
+
+# Try to resolve data dir robustly (avoid common relative path mistakes)
+args.data_dir = resolve_data_dir(args.data_dir)
 
 ### Load and preprocess data ###
 dataset = load_nc_dataset(args)
@@ -110,7 +126,6 @@ else:
 dataset.label = dataset.label.to(device)
 
 # ----------------- DEBUG: label & mask check -----------------
-# place immediately after: dataset.label = dataset.label.to(device)
 try:
     labels = dataset.label
     if labels.dim() > 1:
@@ -124,13 +139,11 @@ try:
 except Exception as e:
     print("DEBUG: failed to print labels info:", e)
 
-# If you want to inspect the first split's train_idx counts (after split_idx_lst is created)
 try:
     if 'split_idx_lst' in locals() and len(split_idx_lst) > 0:
         sample_split = split_idx_lst[0]
         if 'train' in sample_split:
             tr = sample_split['train']
-            # tr may be a tensor of indices or bool mask
             if isinstance(tr, torch.Tensor):
                 if tr.dtype == torch.bool:
                     print("DEBUG: sample_split train mask sum:", int(tr.sum().item()))
@@ -143,34 +156,28 @@ except Exception as e:
 # -------------------------------------------------------------
 
 n = dataset.graph['num_nodes']
-# infer the number of classes for non one-hot and one-hot labels
 c = max(dataset.label.max().item() + 1, dataset.label.shape[1])
 d = dataset.graph['node_feat'].shape[1]
 
 _shape = dataset.graph['node_feat'].shape
 print(f'features shape={_shape}')
 
-# whether or not to symmetrize
 if args.dataset not in {'deezer-europe'}:
     dataset.graph['edge_index'] = to_undirected(dataset.graph['edge_index'])
 
 dataset.graph['edge_index'], dataset.graph['node_feat'] = \
-    dataset.graph['edge_index'].to(
-        device), dataset.graph['node_feat'].to(device)
+    dataset.graph['edge_index'].to(device), dataset.graph['node_feat'].to(device)
 
 if args.method == 'graphormer':
-    dataset.graph['x'] = dataset.graph['x'].to(device)
-    dataset.graph['in_degree'] = dataset.graph['in_degree'].to(device)
-    dataset.graph['out_degree'] = dataset.graph['out_degree'].to(device)
-    dataset.graph['spatial_pos'] = dataset.graph['spatial_pos'].to(device)
-    dataset.graph['attn_bias'] = dataset.graph['attn_bias'].to(device)
+    for k in ('x', 'in_degree', 'out_degree', 'spatial_pos', 'attn_bias'):
+        if k in dataset.graph:
+            dataset.graph[k] = dataset.graph[k].to(device)
 
 print(f"num nodes {n} | num classes {c} | num node feats {d}")
 
 ### Load method ###
 model = parse_method(args.method, args, c, d, device)
 
-import copy
 # --- ensure teacher on same device and frozen ---
 teacher = copy.deepcopy(model)
 teacher.to(device)
@@ -185,13 +192,11 @@ else:
     criterion = nn.NLLLoss()
 
 eval_func = eval_acc
-
 logger = Logger(args.runs, args)
 
 model.train()
 
 ### Training loop ###
-patience = 0
 if args.method == 'ours' and args.use_graph:
     optimizer = torch.optim.Adam([
         {'params': model.params1, 'weight_decay': args.ours_weight_decay},
@@ -205,23 +210,35 @@ else:
 run_time_list = []
 best_val = float('-inf')
 best_val_test = 0.0
+
+# ensure result folders exist
+os.makedirs('results/epoch_logs', exist_ok=True)
+os.makedirs('results', exist_ok=True)
+
 for run in range(args.runs):
+    # choose split
     if args.dataset in ['cora', 'citeseer', 'pubmed'] and args.protocol == 'semi':
         split_idx = split_idx_lst[0]
     else:
         split_idx = split_idx_lst[run]
     train_idx = split_idx['train'].to(device)
+
     model.reset_parameters()
     teacher.load_state_dict(model.state_dict())
     teacher.eval()
 
     best_val = float('-inf')
     patience = 0
+
+    # prepare per-run epoch log path
+    epoch_csv = os.path.join('results/epoch_logs', f'{args.dataset}_{args.method}_seed{args.seed}_run{run}.csv')
+    if not os.path.exists(epoch_csv):
+        with open(epoch_csv, 'w') as f:
+            f.write('epoch,train,val,test,alpha,mean_teacher_conf,cons_nodes,grad_norm\n')
+
     for epoch in range(args.epochs):
         start_time = time.perf_counter()
         # ====== START: S-channel (SimGRACE-style) integration ======
-        # This block replaces the original single-forward -> loss -> backward part.
-        # It performs two stochastic forwards and adds a logits-space MSE consistency loss.
         model.train()
         optimizer.zero_grad()
         emb = None
@@ -233,9 +250,6 @@ for run in range(args.runs):
         T = getattr(args, "cons_temp", 1.0)
         cons_type = getattr(args, "cons_loss", "prob_mse")
         conf_thresh = getattr(args, "cons_confidence", 0.0)
-        cons_max_nodes = getattr(args, "cons_max_nodes", 0)
-        cons_ratio = getattr(args, "cons_ratio", 0.0)
-        cons_gamma = getattr(args, "cons_conf_gamma", 1.0)
 
         # Student forward
         if args.method == 'nodeformer':
@@ -246,7 +260,7 @@ for run in range(args.runs):
         if args.method == 'graphormer':
             out1 = out1.squeeze(0)
 
-        # supervised loss (unchanged)
+        # supervised loss
         if args.dataset in ('deezer-europe'):
             if dataset.label.shape[1] == 1:
                 true_label = F.one_hot(dataset.label, dataset.label.max() + 1).squeeze(1)
@@ -267,105 +281,63 @@ for run in range(args.runs):
             if args.method == 'graphormer':
                 t_out = t_out.squeeze(0)
 
-        # Prepare mask: unlabeled nodes only (avoid disturbing labeled samples)
+        # Prepare mask: unlabeled nodes only
         n_nodes = n
         unlabeled_mask = torch.ones(n_nodes, dtype=torch.bool, device=device)
-        # train_idx 已经 .to(device) 了，直接用索引屏蔽
         unlabeled_mask[train_idx] = False
 
-        # optionally filter by teacher confidence (initial coarse filter)
-        if conf_thresh > 0.0:
-            # use softmax probabilities of teacher
-            p_t_full = F.softmax(t_out / T, dim=1)
-            conf_mask_full = (p_t_full.max(dim=1).values > conf_thresh)
-            candidates_mask = unlabeled_mask & conf_mask_full
+        # compute teacher probabilities for confidence diagnostics (always compute for logging)
+        mean_teacher_conf = 0.0
+        p_t = None
+        try:
+            p_t = F.softmax(t_out / T, dim=1)
+            mean_teacher_conf = float(p_t.max(dim=1).values.mean().item())
+        except Exception:
+            mean_teacher_conf = 0.0
+
+        # optionally filter by teacher confidence
+        if conf_thresh > 0.0 and p_t is not None:
+            conf_mask = (p_t.max(dim=1).values > conf_thresh)
+            use_mask = unlabeled_mask & conf_mask
         else:
-            candidates_mask = unlabeled_mask
+            use_mask = unlabeled_mask
 
-        # If requested, restrict to top-k or top-ratio of candidates by teacher confidence
-        # compute teacher probabilities and confidences
-        p_t_all = F.softmax(t_out / T, dim=1)
-        max_conf_all = p_t_all.max(dim=1).values  # per-node max prob
-
-        # Build ordered candidate indices by confidence descending
-        cand_idx = torch.where(candidates_mask)[0]
-        if cand_idx.numel() == 0:
-            # no candidates -> set use_mask empty
-            use_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
-        else:
-            if cons_ratio > 0.0 and 0.0 < cons_ratio <= 1.0:
-                k = max(1, int(cons_ratio * cand_idx.numel()))
-                # sort candidate indices by confidence
-                conf_vals = max_conf_all[cand_idx]
-                _, order = torch.sort(conf_vals, descending=True)
-                selected = cand_idx[order[:k]]
-                use_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
-                use_mask[selected] = True
-            elif cons_max_nodes > 0:
-                k = min(cons_max_nodes, cand_idx.numel())
-                conf_vals = max_conf_all[cand_idx]
-                _, order = torch.sort(conf_vals, descending=True)
-                selected = cand_idx[order[:k]]
-                use_mask = torch.zeros(n_nodes, dtype=torch.bool, device=device)
-                use_mask[selected] = True
-            else:
-                # use all candidates
-                use_mask = candidates_mask
-
-        # compute consistency loss according to selected type with confidence weighting
-        p_t = p_t_all  # teacher probabilities
-        max_conf = max_conf_all  # teacher confidences
-
+        # compute consistency loss according to selected type
         if use_mask.sum() == 0:
             cons_loss = torch.tensor(0.0, device=device)
-            cons_nodes = 0
-            mean_teacher_conf = float(max_conf.mean().item()) if max_conf.numel() > 0 else 0.0
         else:
-            cons_nodes = int(use_mask.sum().item())
-            idx = torch.where(use_mask)[0]  # selected node indices
-
-            # compute weight per node based on teacher confidence
-            w_raw = max_conf[idx].clamp(min=1e-12) ** cons_gamma  # avoid zero
-            # normalize weights to sum=1 for stability
-            w = w_raw / (w_raw.sum() + 1e-12)
-
-            # compute per-node error based on chosen cons_type
             if cons_type == 'logit_mse':
-                per_node_err = ((out1[idx] - t_out[idx]) ** 2).sum(dim=1)  # (k,)
-                cons_loss = (w * per_node_err).sum()
+                cons_loss = F.mse_loss(out1[use_mask], t_out[use_mask])
             elif cons_type == 'prob_mse':
                 p1 = F.softmax(out1 / T, dim=1)
-                per_node_err = ((p1[idx] - p_t[idx]) ** 2).sum(dim=1)
-                cons_loss = (w * per_node_err).sum()
+                p2 = F.softmax(t_out / T, dim=1)
+                cons_loss = F.mse_loss(p1[use_mask], p2[use_mask])
             elif cons_type == 'kl':
-                # per-node KL (p_teacher || p_student) with temperature correction
                 logp1 = F.log_softmax(out1 / T, dim=1)
-                p2 = p_t[idx]
-                logp1_idx = logp1[idx]
-                per_node_kl = (p2 * (torch.log(p2 + 1e-12) - logp1_idx)).sum(dim=1)
-                cons_loss = (w * per_node_kl).sum() * (T * T)
-            else:  # 'norm_mse' fallback
+                p2 = F.softmax(t_out / T, dim=1)
+                # kl_div expects input: log_prob, target_prob
+                cons_loss = F.kl_div(logp1[use_mask], p2[use_mask], reduction='batchmean') * (T * T)
+            else:  # 'norm_mse'
                 out1_n = F.normalize(out1, p=2, dim=1)
                 t_out_n = F.normalize(t_out, p=2, dim=1)
-                per_node_err = ((out1_n[idx] - t_out_n[idx]) ** 2).sum(dim=1)
-                cons_loss = (w * per_node_err).sum()
+                cons_loss = F.mse_loss(out1_n[use_mask], t_out_n[use_mask])
 
-            # compute mean teacher confidence on selected nodes for logging
-            mean_teacher_conf = float(max_conf[idx].mean().item())
-
-        # alpha warmup (linear). NOTE: warm period: epoch < E_warm -> alpha=0
-        if epoch < E_warm:
-            curr_cons_weight = 0.0
+        # alpha warmup (linear). robust to E_alpha_up == 0
+        if epoch <= E_warm:
+            alpha = 0.0
         else:
             t = epoch - E_warm
-            curr_cons_weight = alpha_target * min(1.0, float(t) / float(E_alpha_up))
+            if E_alpha_up <= 0:
+                # If cons_up == 0, treat as instant full weight after warm
+                alpha = alpha_target
+            else:
+                alpha = alpha_target * min(1.0, float(t) / float(E_alpha_up))
 
         # total loss
-        loss = sup_loss + curr_cons_weight * cons_loss
+        loss = sup_loss + alpha * cons_loss
 
-        # optional nodeformer link loss handling as before
+        # optional nodeformer link loss handling
         if args.method == 'nodeformer':
-            # if two values, average them; original code subtracts lamda * mean(link_loss)
             try:
                 link_loss_avg = [(link_loss1_i) for link_loss1_i in link_loss1]
                 loss -= args.lamda * sum(link_loss_avg) / max(1, len(link_loss_avg))
@@ -375,27 +347,27 @@ for run in range(args.runs):
         # Backprop
         loss.backward()
 
-        # compute grad norm and clip (clip_grad_norm_ returns total_norm)
+        # compute grad norm and clip
         max_norm = 5.0
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm))
 
         optimizer.step()
 
-        # EMA teacher update: only update when epoch >= ema_start AND consistency weight > 0
-        if epoch >= getattr(args, 'ema_start', 0) and curr_cons_weight > 0.0:
+        # EMA teacher update (delayed by ema_start)
+        if epoch >= getattr(args, 'ema_start', 0):
             tau = getattr(args, 'ema_tau', 0.99)
             for s_param, t_param in zip(model.parameters(), teacher.parameters()):
                 t_param.data.mul_(tau).add_(s_param.data * (1.0 - tau))
-        # ====== END: S-channel (teacher-student consistency) ======
 
+        # ====== END S-channel block ======
         end_time = time.perf_counter()
         run_time = 1000 * (end_time - start_time)
         run_time_list.append(run_time)
 
-        result = evaluate(model, dataset, split_idx,
-                          eval_func, criterion, args)
+        result = evaluate(model, dataset, split_idx, eval_func, criterion, args)
         logger.add_result(run, result[:-1])
 
+        # update best/early stopping
         if result[1] > best_val:
             best_val = result[1]
             best_val_test = result[2]
@@ -405,30 +377,38 @@ for run in range(args.runs):
             if patience >= args.patience:
                 break
 
+        # write epoch CSV log
+        try:
+            curr_cons_nodes = int(use_mask.sum().item()) if 'use_mask' in locals() else -1
+        except Exception:
+            curr_cons_nodes = -1
+        try:
+            with open(epoch_csv, 'a') as f:
+                f.write(f"{epoch},{result[0]:.6f},{result[1]:.6f},{result[2]:.6f},{alpha:.6f},{mean_teacher_conf:.6f},{curr_cons_nodes},{grad_norm:.6f}\n")
+        except Exception as e:
+            print("[WARN] failed to write epoch log:", e)
+
         if epoch % args.display_step == 0:
-            mask_count = int(use_mask.sum().item()) if 'use_mask' in locals() else -1
-            grad_norm_val = float(grad_norm) if 'grad_norm' in locals() else -1.0
-            # print more info: curr_cons_weight and mean_teacher_conf
-            mtc = mean_teacher_conf if 'mean_teacher_conf' in locals() else 0.0
-            print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}, Train: {100 * result[0]:.2f}%, Valid: {100 * result[1]:.2f}%, Test: {100 * result[2]:.2f}%, cons_nodes:{mask_count}, curr_cons_weight:{curr_cons_weight:.4f}, mean_teacher_conf:{mtc:.4f}, grad_norm:{grad_norm_val:.4f}')
+            mask_count = curr_cons_nodes
+            print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}, Train: {100 * result[0]:.2f}%, Valid: {100 * result[1]:.2f}%, Test: {100 * result[2]:.2f}%, cons_nodes:{mask_count}, curr_cons_weight:{alpha:.4f}, mean_teacher_conf:{mean_teacher_conf:.4f}, grad_norm:{grad_norm:.4f}')
 
     logger.print_statistics(run)
-    # 追加到CSV: columns = run, best_val, best_test
+    # append per-run summary to csv
     csv_path = os.path.join('results', f'{args.dataset}_{args.method}_results_per_run.csv')
-    os.makedirs('results', exist_ok=True)
-    # append header if file not exists
     if not os.path.exists(csv_path):
         with open(csv_path, 'w') as _f:
             _f.write('run,best_val,best_test\n')
     with open(csv_path, 'a') as _f:
         _f.write(f'{run},{best_val:.6f},{best_val_test:.6f}\n')
 
+# final stats
 run_time = sum(run_time_list) / len(run_time_list) if len(run_time_list) > 0 else 0.0
 results = logger.print_statistics()
 print(results)
 out_folder = 'results'
 if not os.path.exists(out_folder):
     os.mkdir(out_folder)
+
 
 def make_print(method):
     print_str = ''
@@ -437,7 +417,7 @@ def make_print(method):
     else:
         print_str += f'train_prop:{args.train_prop}, valid_prop:{args.valid_prop}'
     if method == 'ours':
-        use_weight=' ours_use_weight' if args.ours_use_weight else ''
+        use_weight = ' ours_use_weight' if args.ours_use_weight else ''
         print_str += f'method: {args.method} hidden: {args.hidden_channels} ours_layers:{args.ours_layers} lr:{args.lr} use_graph:{args.use_graph} aggregate:{args.aggregate} graph_weight:{args.graph_weight} alpha:{args.alpha} ours_decay:{args.ours_weight_decay} ours_dropout:{args.ours_dropout} epochs:{args.epochs} use_feat_norm:{not args.no_feat_norm} use_bn:{args.use_bn} use_residual:{args.ours_use_residual} use_act:{args.ours_use_act}{use_weight}\n'
         if not args.use_graph:
             return print_str
