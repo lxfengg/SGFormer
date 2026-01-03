@@ -88,6 +88,9 @@ parser.add_argument('--cons_confidence', type=float, default=0.0,
 parser.add_argument('--cons_loss', type=str, default='prob_mse',
                     choices=['logit_mse', 'prob_mse', 'kl', 'norm_mse'],
                     help='type of consistency loss to use: logits-MSE, probability-MSE (with temp), KL, or normalized-logits-MSE')
+# Add experiment tag argument so per-run CSV is unambiguous
+parser.add_argument('--exp_tag', type=str, default='unknown',
+                    help="short tag to mark this experiment (e.g. 'baseline' or 'schannel')")
 # main args from parse.py helper
 parser_add_main_args(parser)
 args = parser.parse_args()
@@ -393,13 +396,17 @@ for run in range(args.runs):
             print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}, Train: {100 * result[0]:.2f}%, Valid: {100 * result[1]:.2f}%, Test: {100 * result[2]:.2f}%, cons_nodes:{mask_count}, curr_cons_weight:{alpha:.4f}, mean_teacher_conf:{mean_teacher_conf:.4f}, grad_norm:{grad_norm:.4f}')
 
     logger.print_statistics(run)
-    # append per-run summary to csv
+    # append per-run summary to csv (fixed header & column order)
     csv_path = os.path.join('results', f'{args.dataset}_{args.method}_results_per_run.csv')
+    # ensure results dir exists (should already)
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     if not os.path.exists(csv_path):
         with open(csv_path, 'w') as _f:
-            _f.write('run,best_val,best_test\n')
+            # 固定列顺序：exp_tag,seed,run,best_val,best_test
+            _f.write('exp_tag,seed,run,best_val,best_test\n')
+    seed_val = getattr(args, 'seed', '')
     with open(csv_path, 'a') as _f:
-        _f.write(f'{run},{best_val:.6f},{best_val_test:.6f}\n')
+        _f.write(f'{args.exp_tag},{seed_val},{run},{best_val:.6f},{best_val_test:.6f}\n')
 
 # final stats
 run_time = sum(run_time_list) / len(run_time_list) if len(run_time_list) > 0 else 0.0
