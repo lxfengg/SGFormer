@@ -7,6 +7,7 @@ import sys
 import warnings
 import time
 import subprocess
+import json
 
 import numpy as np
 import torch
@@ -39,7 +40,10 @@ def fix_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    try:
+        torch.cuda.manual_seed(seed)
+    except Exception:
+        pass
     torch.backends.cudnn.deterministic = True
 
 
@@ -49,8 +53,8 @@ def resolve_data_dir(data_dir):
     Returns the found data_dir (or original if none found). Prints info.
     """
     candidates = [data_dir,
-                  os.path.join(os.getcwd(), data_dir),
-                  os.path.abspath(data_dir),
+                  os.path.join(os.getcwd(), data_dir) if data_dir else None,
+                  os.path.abspath(data_dir) if data_dir else None,
                   os.path.join(os.getcwd(), '..', 'data'),
                   os.path.join(os.getcwd(), '..', '..', 'data'),
                   os.path.join(os.getcwd(), 'data'),
@@ -58,7 +62,7 @@ def resolve_data_dir(data_dir):
                   os.path.join(os.path.dirname(__file__), '..', 'data') if '__file__' in globals() else None]
     checked = []
     for c in candidates:
-        if c is None:
+        if not c:
             continue
         if os.path.exists(c):
             # check Planetoid/raw contents
@@ -91,8 +95,9 @@ parser.add_argument('--cons_loss', type=str, default='prob_mse',
 # main args from parse.py helper
 parser_add_main_args(parser)
 
-# <<< CHANGED: add exp_tag argument so we tag runs for postprocessing
-parser.add_argument('--exp_tag', type=str, default='unknown', help="experiment tag (e.g. baseline, schannel) for postprocessing")  # <<< CHANGED
+# Add exp_tag and out_file for robust downstream processing
+parser.add_argument('--exp_tag', type=str, default='unknown', help="experiment tag (e.g. baseline, schannel) for postprocessing")
+parser.add_argument('--out_file', type=str, default=None, help='optional per-run JSON output file path')
 
 args = parser.parse_args()
 parser_add_default_args(args)
@@ -218,6 +223,37 @@ best_val_test = 0.0
 # ensure result folders exist
 os.makedirs('results/epoch_logs', exist_ok=True)
 os.makedirs('results', exist_ok=True)
+
+# utility: robust append/update to CSV with explicit format
+def write_result_csv(csv_path, exp_tag, seed, run_idx, best_val, best_test):
+    # ensure header
+    header = 'exp_tag,seed,run,best_val,best_test\n'
+    if not os.path.exists(csv_path):
+        with open(csv_path, 'w') as f:
+            f.write(header)
+    # read existing
+    try:
+        with open(csv_path, 'r') as f:
+            lines = f.read().splitlines()
+    except Exception:
+        lines = []
+    # prepare new line
+    new_line = f'{exp_tag},{seed},{run_idx},{best_val:.6f},{best_test:.6f}'
+    # search for existing matching key (exp_tag,seed,run)
+    key_prefix = f'{exp_tag},{seed},{run_idx},'
+    found = False
+    for i, ln in enumerate(lines):
+        if ln.startswith(key_prefix):
+            lines[i] = new_line
+            found = True
+            break
+    if not found:
+        # append
+        lines.append(new_line)
+    # write back
+    with open(csv_path, 'w') as f:
+        f.write('\n'.join(lines).strip() + '\n')
+
 
 for run in range(args.runs):
     # choose split
@@ -399,12 +435,27 @@ for run in range(args.runs):
     logger.print_statistics(run)
     # append per-run summary to csv
     csv_path = os.path.join('results', f'{args.dataset}_{args.method}_results_per_run.csv')
-    # <<< CHANGED: write header including exp_tag and seed; append lines with exp_tag,seed,run,best_val,best_test
-    if not os.path.exists(csv_path):
-        with open(csv_path, 'w') as _f:
-            _f.write('exp_tag,seed,run,best_val,best_test\n')  # <<< CHANGED
-    with open(csv_path, 'a') as _f:
-        _f.write(f'{getattr(args,"exp_tag","unknown")},{args.seed},{run},{best_val:.6f},{best_val_test:.6f}\n')  # <<< CHANGED
+    # write/overwrite one canonical CSV with consistent header and format
+    write_result_csv(csv_path, getattr(args, 'exp_tag', 'unknown'), args.seed, run, best_val, best_val_test)
+
+    # optional per-run JSON file (useful for robust run collection)
+    if args.out_file:
+        try:
+            os.makedirs(os.path.dirname(args.out_file), exist_ok=True)
+        except Exception:
+            pass
+        try:
+            info = {
+                'exp_tag': getattr(args, 'exp_tag', 'unknown'),
+                'seed': args.seed,
+                'run': run,
+                'best_val': float(best_val),
+                'best_test': float(best_val_test)
+            }
+            with open(args.out_file, 'w') as jf:
+                json.dump(info, jf)
+        except Exception as e:
+            print('[WARN] failed to write out_file:', e)
 
 # final stats
 run_time = sum(run_time_list) / len(run_time_list) if len(run_time_list) > 0 else 0.0
