@@ -1,0 +1,6 @@
+paired seeds: 30
+baseline mean: 0.802233
+schannel mean: 0.802167
+mean diff (sch - base): -0.000067
+paired t: t=-0.0286, p=9.773572e-01
+cohen d: -0.0052

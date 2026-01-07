@@ -1,0 +1,6 @@
+paired seeds: 5
+baseline mean: 0.793000
+schannel mean: 0.793000
+mean diff (sch - base): 0.000000
+paired t: t=nan, p=nan
+cohen d: nan
