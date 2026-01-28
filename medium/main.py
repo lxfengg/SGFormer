@@ -1,3 +1,4 @@
+# 保存为 main.py
 #!/usr/bin/env python3
 import argparse
 import copy
@@ -72,20 +73,6 @@ def resolve_data_dir(data_dir):
     return data_dir
 
 
-def random_edge_dropout(edge_index, drop_prob, device):
-    """Simple random edge dropout on edge_index tensor [2, E]. Returns new edge_index on same device."""
-    if edge_index is None:
-        return edge_index
-    E = edge_index.shape[1]
-    if drop_prob <= 0.0 or E == 0:
-        return edge_index
-    mask = (torch.rand(E, device=device) > drop_prob)
-    if mask.sum() == 0:
-        # keep at least one edge
-        mask[torch.randint(0, E, (1,), device=device)] = True
-    return edge_index[:, mask]
-
-
 ### Parse args ###
 parser = argparse.ArgumentParser(description='General Training Pipeline')
 parser.add_argument('--cons_warm', type=int, default=10, help='supervised pre-warm epochs before consistency')
@@ -96,23 +83,6 @@ parser.add_argument('--ema_tau', type=float, default=0.99, help='EMA momentum fo
 parser.add_argument('--ema_start', type=int, default=10, help='number of epochs before EMA teacher starts updating')
 parser.add_argument('--cons_confidence', type=float, default=0.0, help='min prob threshold for using teacher predictions in consistency (0.0 = no confidence filtering)')
 parser.add_argument('--cons_loss', type=str, default='prob_mse', choices=['logit_mse', 'prob_mse', 'kl', 'norm_mse'], help='type of consistency loss to use')
-
-# NodeMixup (B)
-parser.add_argument('--use_node_mixup', action='store_true', help='enable NodeMixup on training nodes (feature-level mixup)')
-parser.add_argument('--mixup_alpha', type=float, default=0.3, help='beta distribution alpha for mixup')
-parser.add_argument('--mixup_on', type=str, default='feat', choices=['feat'], help='where to apply mixup; default: feat (input features)')
-
-# CI-GCL / auxiliary loss (E) (simple placeholder implementation)
-parser.add_argument('--use_ci_gcl', action='store_true', help='enable CI-GCL style auxiliary loss (simple implementation)')
-parser.add_argument('--aux_weight', type=float, default=0.05, help='weight for auxiliary loss (w_aux)')
-parser.add_argument('--ci_drop_edge', type=float, default=0.2, help='edge drop probability for CI-GCL augmentation')
-parser.add_argument('--ci_feat_mask', type=float, default=0.1, help='feature mask probability for CI-GCL augmentation')
-
-# Stage control & checkpoint
-parser.add_argument('--stage', type=str, default='both', choices=['pretrain', 'finetune', 'both'], help='training stage: pretrain (D only), finetune (B+D+E), or both')
-parser.add_argument('--save_checkpoints', action='store_true', help='save best model checkpoints per run')
-parser.add_argument('--load_pretrain', type=str, default=None, help='path to pretrained checkpoint to load when finetune')
-
 # main args from parse.py helper
 parser_add_main_args(parser)
 
@@ -120,11 +90,14 @@ parser_add_main_args(parser)
 parser.add_argument('--exp_tag', type=str, default='unknown', help="experiment tag (e.g. baseline, schannel) for postprocessing")
 parser.add_argument('--out_file', type=str, default=None, help='optional per-run JSON output file path')
 
+# NEW: save checkpoints option
+parser.add_argument('--save_checkpoints', action='store_true', help='save best student+teacher checkpoints to results/checkpoints/')
+
 args = parser.parse_args()
 parser_add_default_args(args)
 print(args)
 
-# Fix seed and device (initial)
+# Fix seed and device
 fix_seed(args.seed)
 if args.cpu:
     device = torch.device("cpu")
@@ -249,7 +222,6 @@ def write_result_csv(csv_path, exp_tag, seed, run_idx, best_val, best_test):
     if not os.path.exists(csv_path):
         with open(csv_path, 'w') as f:
             f.write(header)
-    # read existing lines reliably
     try:
         with open(csv_path, 'r') as f:
             lines = f.read().splitlines()
@@ -265,9 +237,6 @@ def write_result_csv(csv_path, exp_tag, seed, run_idx, best_val, best_test):
             break
     if not found:
         lines.append(new_line)
-    # Ensure header present
-    if len(lines) == 0 or not lines[0].startswith('exp_tag,seed,run'):
-        lines.insert(0, header.strip())
     with open(csv_path, 'w') as f:
         f.write('\n'.join(lines).strip() + '\n')
 
@@ -278,12 +247,6 @@ for run in range(args.runs):
         split_idx = split_idx_lst[0]
     else:
         split_idx = split_idx_lst[run]
-
-    # adjust seed per run to avoid repeated identical seeds when using runs>1
-    current_seed = int(args.seed) + int(run)
-    fix_seed(current_seed)
-
-    # set train_idx and other split tensors to device
     train_idx = split_idx['train'].to(device)
 
     model.reset_parameters()
@@ -295,15 +258,15 @@ for run in range(args.runs):
 
     # prepare per-run epoch log path
     safe_tag = str(getattr(args, 'exp_tag', 'unknown')).replace('/', '_').replace(' ', '_')
-    epoch_csv = os.path.join('results/epoch_logs', f'{args.dataset}_{args.method}_{safe_tag}_seed{current_seed}_run{run}.csv')
+    epoch_csv = os.path.join('results/epoch_logs', f'{args.dataset}_{args.method}_{safe_tag}_seed{args.seed}_run{run}.csv')
     if not os.path.exists(epoch_csv):
         with open(epoch_csv, 'w') as f:
-            f.write('epoch,train,val,test,alpha,cons_loss,aux_loss,mixup_lambda,mean_teacher_conf,cons_nodes,grad_norm\n')
+            f.write('epoch,train,val,test,alpha,mean_teacher_conf,cons_nodes,grad_norm,cons_loss,aux_loss\n')
 
 
     for epoch in range(args.epochs):
         start_time = time.perf_counter()
-        # ====== START: S-channel (SimGRACE-style) + B + E integration ======
+        # ====== START: S-channel (SimGRACE-style) integration ======
         model.train()
         optimizer.zero_grad()
         emb = None
@@ -316,51 +279,6 @@ for run in range(args.runs):
         cons_type = getattr(args, "cons_loss", "prob_mse")
         conf_thresh = getattr(args, "cons_confidence", 0.0)
 
-        # Student forward (may be replaced if mixup applied)
-        # We will potentially temporary replace node_feat in dataset for mixup augmentation.
-        orig_node_feat = dataset.graph['node_feat']
-        orig_edge_index = dataset.graph['edge_index']
-
-        mixup_lambda = 0.0
-        if args.use_node_mixup and args.stage in ('both', 'finetune'):
-            try:
-                # apply mixup on training node features
-                alpha = float(args.mixup_alpha)
-                if alpha > 0.0 and train_idx.numel() > 1:
-                    lam = np.random.beta(alpha, alpha)
-                    perm = train_idx[torch.randperm(train_idx.numel(), device=device)]
-                    node_feat_mixed = orig_node_feat.clone()
-                    # lam * x_i + (1-lam) * x_j  on train_idx
-                    node_feat_mixed[train_idx] = lam * orig_node_feat[train_idx] + (1.0 - lam) * orig_node_feat[perm]
-                    dataset.graph['node_feat'] = node_feat_mixed
-                    mixup_lambda = float(lam)
-                else:
-                    mixup_lambda = 1.0
-            except Exception as e:
-                print("[WARN] mixup failed, proceeding without mixup:", e)
-                dataset.graph['node_feat'] = orig_node_feat
-                mixup_lambda = 0.0
-
-        # Optionally apply CI-GCL augmentation for aux computation (but keep orig for teacher)
-        aux_loss = torch.tensor(0.0, device=device)
-        if args.use_ci_gcl and args.stage in ('both', 'finetune'):
-            try:
-                # create augmented view by dropping edges and masking features
-                aug_edge_index = random_edge_dropout(orig_edge_index, args.ci_drop_edge, device)
-                aug_node_feat = orig_node_feat.clone()
-                if args.ci_feat_mask > 0.0:
-                    mask = (torch.rand_like(aug_node_feat) > args.ci_feat_mask).float()
-                    aug_node_feat = aug_node_feat * mask
-                # prepare temporary augmented dataset object
-                dataset_aug = copy.deepcopy(dataset)
-                dataset_aug.graph['edge_index'] = aug_edge_index
-                dataset_aug.graph['node_feat'] = aug_node_feat
-            except Exception as e:
-                print("[WARN] ci_gcl augmentation failed:", e)
-                dataset_aug = None
-        else:
-            dataset_aug = None
-
         # Student forward
         if args.method == 'nodeformer':
             out1, link_loss1 = model(dataset)
@@ -370,7 +288,7 @@ for run in range(args.runs):
         if args.method == 'graphormer':
             out1 = out1.squeeze(0)
 
-        # supervised loss (NodeMixup handled because dataset.graph['node_feat'] may have been mixed)
+        # supervised loss
         if args.dataset in ('deezer-europe'):
             if dataset.label.shape[1] == 1:
                 true_label = F.one_hot(dataset.label, dataset.label.max() + 1).squeeze(1)
@@ -381,17 +299,20 @@ for run in range(args.runs):
             out1_logp = F.log_softmax(out1, dim=1)
             sup_loss = criterion(out1_logp[train_idx], dataset.label.squeeze(1)[train_idx])
 
-        # Teacher forward (no grad) - teacher uses ORIGINAL features (so ensure orig restored)
+        # Teacher forward (no grad)
         teacher.eval()
         with torch.no_grad():
-            # ensure teacher uses orig features (not mixed)
-            dataset.graph['node_feat'] = orig_node_feat
             if args.method == 'nodeformer':
                 t_out, _ = teacher(dataset)
             else:
                 t_out = teacher(dataset)
             if args.method == 'graphormer':
                 t_out = t_out.squeeze(0)
+
+        # Prepare mask: unlabeled nodes only
+        n_nodes = n
+        unlabeled_mask = torch.ones(n_nodes, dtype=torch.bool, device=device)
+        unlabeled_mask[train_idx] = False
 
         # compute teacher probabilities for confidence diagnostics (always compute for logging)
         mean_teacher_conf = 0.0
@@ -402,11 +323,6 @@ for run in range(args.runs):
         except Exception:
             mean_teacher_conf = 0.0
 
-        # Prepare mask: unlabeled nodes only
-        n_nodes = n
-        unlabeled_mask = torch.ones(n_nodes, dtype=torch.bool, device=device)
-        unlabeled_mask[train_idx] = False
-
         # optionally filter by teacher confidence
         if conf_thresh > 0.0 and p_t is not None:
             conf_mask = (p_t.max(dim=1).values > conf_thresh)
@@ -414,7 +330,7 @@ for run in range(args.runs):
         else:
             use_mask = unlabeled_mask
 
-        # compute consistency loss according to selected type (on teacher t_out and student out1)
+        # compute consistency loss according to selected type
         if use_mask.sum() == 0:
             cons_loss = torch.tensor(0.0, device=device)
         else:
@@ -433,28 +349,8 @@ for run in range(args.runs):
                 t_out_n = F.normalize(t_out, p=2, dim=1)
                 cons_loss = F.mse_loss(out1_n[use_mask], t_out_n[use_mask])
 
-        # compute aux_loss (simple CI-GCL placeholder): L2 between normalized student outputs on original and augmented view
-        if dataset_aug is not None:
-            try:
-                # dataset_aug uses augmented features/edges
-                if args.method == 'nodeformer':
-                    out_aug, _ = model(dataset_aug)
-                else:
-                    out_aug = model(dataset_aug)
-                if args.method == 'graphormer':
-                    out_aug = out_aug.squeeze(0)
-                out1_n = F.normalize(out1, p=2, dim=1)
-                out_aug_n = F.normalize(out_aug, p=2, dim=1)
-                aux_loss = F.mse_loss(out1_n, out_aug_n)
-            except Exception as e:
-                print("[WARN] aux_loss computation failed:", e)
-                aux_loss = torch.tensor(0.0, device=device)
-        else:
-            aux_loss = torch.tensor(0.0, device=device)
-
         # alpha warmup (linear). robust to E_alpha_up == 0
-        # NOTE: use epoch < E_warm so that warm-up begins at epoch == E_warm
-        if epoch < E_warm:
+        if epoch <= E_warm:
             alpha = 0.0
         else:
             t = epoch - E_warm
@@ -463,8 +359,8 @@ for run in range(args.runs):
             else:
                 alpha = alpha_target * min(1.0, float(t) / float(E_alpha_up))
 
-        # total loss with aux
-        loss = sup_loss + alpha * cons_loss + args.aux_weight * aux_loss
+        # total loss
+        loss = sup_loss + alpha * cons_loss
 
         # optional nodeformer link loss handling
         if args.method == 'nodeformer':
@@ -489,11 +385,7 @@ for run in range(args.runs):
             for s_param, t_param in zip(model.parameters(), teacher.parameters()):
                 t_param.data.mul_(tau).add_(s_param.data * (1.0 - tau))
 
-        # restore original dataset features/edges if we mutated them
-        dataset.graph['node_feat'] = orig_node_feat
-        dataset.graph['edge_index'] = orig_edge_index
-
-        # ====== END S-channel + B + E block ======
+        # ====== END S-channel block ======
         end_time = time.perf_counter()
         run_time = 1000 * (end_time - start_time)
         run_time_list.append(run_time)
@@ -506,15 +398,22 @@ for run in range(args.runs):
             best_val = result[1]
             best_val_test = result[2]
             patience = 0
-            # save checkpoint if desired
-            if args.save_checkpoints:
+
+            # SAVE checkpoint when improved
+            if getattr(args, 'save_checkpoints', False):
+                ckpt_path = os.path.join('results', 'checkpoints', f'{args.dataset}_{safe_tag}_seed{args.seed}_run{run}_best.pth')
                 try:
-                    ckpt_path = os.path.join('results', 'checkpoints', f'{safe_tag}_seed{current_seed}_run{run}_best.pth')
-                    torch.save({'model_state_dict': model.state_dict(),
-                                'optimizer_state_dict': optimizer.state_dict(),
-                                'epoch': epoch,
-                                'best_val': best_val,
-                                'best_test': best_val_test}, ckpt_path)
+                    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+                    save_dict = {
+                        'model_state': model.state_dict(),
+                        'teacher_state': teacher.state_dict(),
+                        'args': vars(args),
+                        'best_val': float(best_val),
+                        'best_val_test': float(best_val_test),
+                        'epoch': epoch
+                    }
+                    torch.save(save_dict, ckpt_path)
+                    print(f"[INFO] Saved best checkpoint to {ckpt_path}")
                 except Exception as e:
                     print("[WARN] failed to save checkpoint:", e)
         else:
@@ -529,18 +428,23 @@ for run in range(args.runs):
             curr_cons_nodes = -1
         try:
             with open(epoch_csv, 'a') as f:
-                f.write(f"{epoch},{result[0]:.6f},{result[1]:.6f},{result[2]:.6f},{alpha:.6f},{float(cons_loss):.6f},{float(aux_loss):.6f},{mixup_lambda:.6f},{mean_teacher_conf:.6f},{curr_cons_nodes},{grad_norm:.6f}\n")
+                # also log cons_loss and aux_loss if available
+                try:
+                    aux_val = float(0.0)
+                except Exception:
+                    aux_val = 0.0
+                f.write(f"{epoch},{result[0]:.6f},{result[1]:.6f},{result[2]:.6f},{alpha:.6f},{mean_teacher_conf:.6f},{curr_cons_nodes},{grad_norm:.6f},{float(cons_loss):.6f},{aux_val:.6f}\n")
         except Exception as e:
             print("[WARN] failed to write epoch log:", e)
 
         if epoch % args.display_step == 0:
             mask_count = curr_cons_nodes
-            print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}, Train: {100 * result[0]:.2f}%, Valid: {100 * result[1]:.2f}%, Test: {100 * result[2]:.2f}%, cons_nodes:{mask_count}, curr_cons_weight:{alpha:.4f}, cons_loss:{float(cons_loss):.6f}, aux_loss:{float(aux_loss):.6f}, mean_teacher_conf:{mean_teacher_conf:.4f}, grad_norm:{grad_norm:.4f}')
+            print(f'Epoch: {epoch:02d}, Loss: {loss:.4f}, Train: {100 * result[0]:.2f}%, Valid: {100 * result[1]:.2f}%, Test: {100 * result[2]:.2f}%, cons_nodes:{mask_count}, curr_cons_weight:{alpha:.4f}, mean_teacher_conf:{mean_teacher_conf:.4f}, grad_norm:{grad_norm:.4f}')
 
     logger.print_statistics(run)
     # append per-run summary to csv
     csv_path = os.path.join('results', f'{args.dataset}_{args.method}_results_per_run.csv')
-    write_result_csv(csv_path, getattr(args, 'exp_tag', 'unknown'), current_seed, run, best_val, best_val_test)
+    write_result_csv(csv_path, getattr(args, 'exp_tag', 'unknown'), args.seed, run, best_val, best_val_test)
 
     # optional per-run JSON file (useful for robust run collection)
     if args.out_file:
@@ -551,7 +455,7 @@ for run in range(args.runs):
         try:
             info = {
                 'exp_tag': getattr(args, 'exp_tag', 'unknown'),
-                'seed': current_seed,
+                'seed': args.seed,
                 'run': run,
                 'best_val': float(best_val),
                 'best_test': float(best_val_test)
