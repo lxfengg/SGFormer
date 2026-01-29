@@ -1,0 +1,17 @@
+{
+  "stats": {
+    "n": 30,
+    "meanA": 0.7931000000000001,
+    "meanB": 0.7996666666666667,
+    "stdA": 0.010974421671982666,
+    "stdB": 0.010774597626964465,
+    "mean_diff": 0.006566666666666665,
+    "sd_diff": 0.01296595896777493,
+    "t": 2.7739648643727093,
+    "p": 0.009584326126817557,
+    "cohen_d": 0.5064543766478973
+  },
+  "rows_csv": "results/figs_pair/pairwise_rows_A_fair_vs_A_plus_S_best_test.csv",
+  "boxplot": "results/figs_pair/boxplot_A_fair_vs_A_plus_S_best_test.png",
+  "scatter": "results/figs_pair/paired_scatter_A_fair_vs_A_plus_S_best_test.png"
+}
