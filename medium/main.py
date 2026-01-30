@@ -1,4 +1,3 @@
-# 保存为 main.py
 #!/usr/bin/env python3
 import argparse
 import copy
@@ -312,7 +311,25 @@ for run in range(args.runs):
         # Prepare mask: unlabeled nodes only
         n_nodes = n
         unlabeled_mask = torch.ones(n_nodes, dtype=torch.bool, device=device)
-        unlabeled_mask[train_idx] = False
+        # exclude training nodes
+        try:
+            if isinstance(train_idx, torch.Tensor):
+                unlabeled_mask[train_idx] = False
+            else:
+                unlabeled_mask[torch.tensor(train_idx, device=device)] = False
+        except Exception:
+            pass
+        # IMPORTANT: also exclude validation and test nodes to avoid target leakage
+        for key in ('valid', 'valid_idx', 'val', 'test'):
+            if key in split_idx:
+                idx = split_idx[key]
+                try:
+                    if isinstance(idx, torch.Tensor):
+                        unlabeled_mask[idx] = False
+                    else:
+                        unlabeled_mask[torch.tensor(idx, device=device)] = False
+                except Exception:
+                    pass
 
         # compute teacher probabilities for confidence diagnostics (always compute for logging)
         mean_teacher_conf = 0.0

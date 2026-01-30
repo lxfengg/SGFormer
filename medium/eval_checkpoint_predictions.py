@@ -1,206 +1,190 @@
-# 保存为 eval_checkpoint_predictions.py
-import torch, os, argparse, numpy as np
+#!/usr/bin/env python3
+# Robust eval_checkpoint_predictions.py
+# Replace the existing script with this file. It attempts to build a fallback args Namespace
+# from checkpoint['args'] and fill missing attributes with safe defaults so parse_method won't fail.
+
+import os
+import sys
+import json
+import argparse
+import torch
+import numpy as np
+
 from dataset import load_nc_dataset
-from parse import parse_method
-from data_utils import load_fixed_splits
+from parse import parse_method  # your repo's parse_method
+from data_utils import load_fixed_splits, evaluate, eval_acc
+from types import SimpleNamespace
 
-parser = argparse.ArgumentParser()
-parser.add_argument('--ckpt', required=True)
-parser.add_argument('--dataset', default='cora')
-parser.add_argument('--device', type=str, default=None, help='cuda:0 or cpu')
-args = parser.parse_args()
+def dict_to_ns(d):
+    """Convert dict to namespace, keep nested dicts as-is."""
+    if isinstance(d, SimpleNamespace):
+        return d
+    if isinstance(d, dict):
+        return SimpleNamespace(**d)
+    return d
 
-# device
-if args.device:
-    device = torch.device(args.device)
-else:
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def ensure_defaults(ns):
+    """Ensure a set of commonly-used args exist on the namespace with safe defaults."""
+    defaults = {
+        'method': getattr(ns, 'method', 'ours'),
+        'alpha': getattr(ns, 'alpha', 0.5),
+        'num_layers': getattr(ns, 'num_layers', 2),
+        'hidden_channels': getattr(ns, 'hidden_channels', 64),
+        'num_heads': getattr(ns, 'num_heads', 4),
+        'backbone': getattr(ns, 'backbone', 'gcn'),
+        'use_graph': getattr(ns, 'use_graph', True),
+        'ours_layers': getattr(ns, 'ours_layers', 2),
+        'ours_dropout': getattr(ns, 'ours_dropout', 0.5),
+        'dropout': getattr(ns, 'dropout', 0.5),
+        'lr': getattr(ns, 'lr', 0.01),
+        'weight_decay': getattr(ns, 'weight_decay', 5e-4),
+        'ours_weight_decay': getattr(ns, 'ours_weight_decay', 5e-4),
+        'ours_use_weight': getattr(ns, 'ours_use_weight', False),
+        'use_bn': getattr(ns, 'use_bn', False),
+        'use_residual': getattr(ns, 'use_residual', False),
+        'use_act': getattr(ns, 'use_act', True),
+        'aggregate': getattr(ns, 'aggregate', 'sum'),
+        'hops': getattr(ns, 'hops', 2),
+        'gat_heads': getattr(ns, 'gat_heads', 1),
+        'out_heads': getattr(ns, 'out_heads', 1),
+        'lamda': getattr(ns, 'lamda', 0.0),
+        'num_elayers': getattr(ns, 'num_elayers', 1),
+        'encoder_emdim': getattr(ns, 'encoder_emdim', 64),
+        'attention': getattr(ns, 'attention', 'dot'),
+        'ours_dropout': getattr(ns, 'ours_dropout', 0.5),
+        'cons_weight': getattr(ns, 'cons_weight', 0.0),
+        'cons_loss': getattr(ns, 'cons_loss', 'prob_mse'),
+        'cons_confidence': getattr(ns, 'cons_confidence', 0.0),
+        'ema_tau': getattr(ns, 'ema_tau', 0.99),
+        'ema_start': getattr(ns, 'ema_start', 10),
+        'seed': getattr(ns, 'seed', 0),
+    }
+    for k, v in defaults.items():
+        if not hasattr(ns, k):
+            setattr(ns, k, v)
+    return ns
 
-print("dataset:", args.dataset)
-# load dataset
-class A: pass
-a = A(); a.dataset = args.dataset; a.data_dir = None
-dataset = load_nc_dataset(a)
-# get splits
-try:
-    split_idx = dataset.get_idx_split(train_prop=0.05, valid_prop=0.185)
-except Exception:
-    split_idx = load_fixed_splits(dataset, name=args.dataset, protocol='semi')[0]
-
-n = dataset.graph['num_nodes']
-labels = dataset.label.squeeze(1).cpu().numpy()
-
-# load ckpt
-ck = torch.load(args.ckpt, map_location=device)
-print("LOADED CKPT KEYS:", list(ck.keys()))
-
-# build args object for parse_method from ckpt['args'] if present
-ck_args = ck.get('args', {}) if isinstance(ck.get('args', {}), dict) else {}
-class DArgs: pass
-dargs = DArgs()
-
-# Helper to set attribute with fallback
-def set_attr(name, default=None):
-    if name in ck_args:
-        val = ck_args[name]
-    else:
-        val = default
-    setattr(dargs, name, val)
-
-# Common fields used by parse_method in many repos - set sensible defaults
-set_attr('method', ck_args.get('method', 'ours'))
-set_attr('backbone', ck_args.get('backbone', 'gcn'))
-set_attr('num_layers', ck_args.get('num_layers', 2))
-set_attr('hidden_channels', ck_args.get('hidden_channels', ck_args.get('hidden', 64)))
-set_attr('use_graph', ck_args.get('use_graph', True))
-set_attr('ours_layers', ck_args.get('ours_layers', ck_args.get('layers', 2)))
-set_attr('ours_weight_decay', ck_args.get('ours_weight_decay', ck_args.get('weight_decay', 5e-4)))
-set_attr('weight_decay', ck_args.get('weight_decay', 5e-4))
-set_attr('dropout', ck_args.get('dropout', 0.5))
-# Add any other commonly referenced flags with defaults
-set_attr('hidden', getattr(dargs, 'hidden_channels', 64))
-set_attr('device', 0)
-
-# Now create model
-c = int(max(dataset.label.max().item() + 1, dataset.label.shape[1]))
-d = int(dataset.graph['node_feat'].shape[1])
-
-try:
-    model = parse_method(dargs.method, dargs, c, d, device)
-except Exception as e:
-    print("Failed to create model via parse_method with dargs; error:", e)
-    print("Attempting to create model with minimal defaults...")
-    # minimal fallback args object
-    class FallbackArgs: pass
-    fargs = FallbackArgs()
-    fargs.method = getattr(dargs, 'method', 'ours')
-    fargs.backbone = getattr(dargs, 'backbone', 'gcn')
-    fargs.num_layers = getattr(dargs, 'num_layers', 2)
-    fargs.hidden_channels = getattr(dargs, 'hidden_channels', 64)
-    fargs.use_graph = getattr(dargs, 'use_graph', True)
+def safe_load_ckpt(ckpt_path, device):
     try:
-        model = parse_method(fargs.method, fargs, c, d, device)
-    except Exception as e2:
-        print("Fallback model creation failed:", e2)
-        raise RuntimeError("Could not instantiate model. Please inspect parse_method signature or provide a custom model loader.")
-
-# load model state
-state_loaded = False
-if 'model_state' in ck:
-    try:
-        model.load_state_dict(ck['model_state'], strict=False)
-        state_loaded = True
+        ck = torch.load(ckpt_path, map_location=device)
+        return ck
     except Exception as e:
-        print("Warning: model_state load failed (non-strict) ->", e)
-elif 'state_dict' in ck:
-    try:
-        model.load_state_dict(ck['state_dict'], strict=False)
-        state_loaded = True
-    except Exception as e:
-        print("Warning: state_dict load failed ->", e)
-else:
-    # try raw dict
-    if isinstance(ck, dict):
-        try:
-            model.load_state_dict(ck, strict=False)
-            state_loaded = True
-        except Exception as e:
-            print("Warning: direct ck load failed ->", e)
-
-if not state_loaded:
-    print("Warning: model state not loaded cleanly. inspect checkpoint keys and shapes.")
-
-# teacher if present
-teacher_present = False
-teacher = None
-if 'teacher_state' in ck:
-    teacher_present = True
-    try:
-        teacher = parse_method(dargs.method, dargs, c, d, device)
-        teacher.load_state_dict(ck['teacher_state'], strict=False)
-        teacher.to(device)
-        teacher.eval()
-    except Exception as e:
-        print("Warning: teacher instantiation/load failed ->", e)
-        teacher_present = False
-        teacher = None
-
-model.to(device)
-model.eval()
-
-# forward
-with torch.no_grad():
-    out = model(dataset)
-    if isinstance(out, tuple):
-        out = out[0]
-    probs = torch.softmax(out, dim=1).cpu().numpy()
-    preds = probs.argmax(axis=1)
-    confs = probs.max(axis=1)
-
-if teacher_present:
-    with torch.no_grad():
-        tout = teacher(dataset)
-        if isinstance(tout, tuple):
-            tout = tout[0]
-        tprobs = torch.softmax(tout, dim=1).cpu().numpy()
-        tpreds = tprobs.argmax(axis=1)
-        tconfs = tprobs.max(axis=1)
-else:
-    tpreds = None; tconfs = None
-
-# splits
-train_idx = split_idx['train'].cpu().numpy().tolist()
-val_idx = split_idx['valid'].cpu().numpy().tolist()
-test_idx = split_idx['test'].cpu().numpy().tolist()
-all_idx = set(range(n))
-unlabeled_idx = sorted(list(all_idx - set(train_idx)))
-
-# helper
-def acc_on(idx_list, arr):
-    if len(idx_list) == 0:
+        print(f"[ERROR] loading checkpoint {ckpt_path}: {e}")
         return None
-    return float((arr[idx_list] == labels[idx_list]).mean())
 
-# print summary
-print("=== Summary ===")
-print("Num nodes:", n)
-print("Train/Val/Test sizes:", len(train_idx), len(val_idx), len(test_idx))
-print("Student acc - train/val/test: {:.4f} / {:.4f} / {:.4f}".format(
-    acc_on(train_idx, preds) if acc_on(train_idx, preds) is not None else float('nan'),
-    acc_on(val_idx, preds) if acc_on(val_idx, preds) is not None else float('nan'),
-    acc_on(test_idx, preds) if acc_on(test_idx, preds) is not None else float('nan')
-))
-if teacher_present:
-    print("Teacher acc - train/val/test: {:.4f} / {:.4f} / {:.4f}".format(
-        acc_on(train_idx, tpreds) if acc_on(train_idx, tpreds) is not None else float('nan'),
-        acc_on(val_idx, tpreds) if acc_on(val_idx, tpreds) is not None else float('nan'),
-        acc_on(test_idx, tpreds) if acc_on(test_idx, tpreds) is not None else float('nan')
-    ))
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--ckpt', required=True)
+    parser.add_argument('--dataset', required=True)
+    parser.add_argument('--data_dir', default=None)
+    args = parser.parse_args()
 
-print("Student overall unlabeled acc: {:.4f}".format(acc_on(unlabeled_idx, preds)))
-if teacher_present:
-    print("Teacher overall unlabeled acc: {:.4f}".format(acc_on(unlabeled_idx, tpreds)))
+    device = torch.device("cpu")
+    ckpt = safe_load_ckpt(args.ckpt, device)
+    if ckpt is None:
+        print("[ERROR] cannot load checkpoint, exiting")
+        return
 
-# confidence summary (student)
-unl_conf = confs[unlabeled_idx] if len(unlabeled_idx)>0 else np.array([])
-if unl_conf.size>0:
-    print("Student confidences on unlabeled: mean {:.4f} median {:.4f} 90p {:.4f}".format(
-        float(unl_conf.mean()), float(np.median(unl_conf)), float(np.percentile(unl_conf,90))
-    ))
-    for thr in [0.5,0.6,0.7,0.8]:
-        cnt = int((unl_conf > thr).sum())
-        print(f"Student conf > {thr}: {cnt}/{len(unlabeled_idx)}")
-else:
-    print("No unlabeled nodes to evaluate/confidence stats.")
-
-if teacher_present:
-    t_unl_conf = tconfs[unlabeled_idx] if len(unlabeled_idx)>0 else np.array([])
-    if t_unl_conf.size>0:
-        print("Teacher confidences on unlabeled: mean {:.4f} median {:.4f} 90p {:.4f}".format(
-            float(t_unl_conf.mean()), float(np.median(t_unl_conf)), float(np.percentile(t_unl_conf,90))
-        ))
-        for thr in [0.5,0.6,0.7,0.8]:
-            cnt = int((t_unl_conf > thr).sum())
-            print(f"Teacher conf > {thr}: {cnt}/{len(unlabeled_idx)}")
+    # If checkpoint contains args as dict, namespace-ify them; otherwise use as-is.
+    raw_args = ckpt.get('args', {})
+    if isinstance(raw_args, dict):
+        dargs = dict_to_ns(raw_args)
     else:
-        print("Teacher present but no unlabeled confs computed.")
+        dargs = raw_args if raw_args is not None else SimpleNamespace()
+    # Ensure defaults to avoid AttributeError in parse_method
+    dargs = ensure_defaults(dargs)
+
+    # Now try to create dataset and model
+    try:
+        # load dataset with provided options if possible
+        if args.data_dir:
+            setattr(dargs, 'data_dir', args.data_dir)
+        else:
+            # if ckpt args provide data_dir, keep it; else set reasonable default
+            if not hasattr(dargs, 'data_dir') or dargs.data_dir is None:
+                setattr(dargs, 'data_dir', os.path.join(os.getcwd(), 'data'))
+
+        # load dataset using your repo loader
+        dataset = load_nc_dataset(dargs)
+        if len(dataset.label.shape) == 1:
+            dataset.label = dataset.label.unsqueeze(1)
+        c = int(max(dataset.label.max().item() + 1, dataset.label.shape[1]))
+        d = int(dataset.graph['node_feat'].shape[1])
+    except Exception as e:
+        print(f"[WARN] failed to load dataset or infer c/d from data: {e}")
+        c = None; d = None
+
+    model = None
+    try:
+        # parse_method expects (method, args, c, d, device)
+        model = parse_method(dargs.method, dargs, c, d, device)
+    except Exception as e:
+        print(f"[WARN] parse_method failed with provided dargs: {e}")
+        # attempt a second fallback by setting minimal args
+        fb = SimpleNamespace(method=getattr(dargs,'method','ours'),
+                             alpha=getattr(dargs,'alpha',0.5),
+                             num_layers=getattr(dargs,'num_layers',2),
+                             hidden_channels=getattr(dargs,'hidden_channels',64),
+                             use_graph=getattr(dargs,'use_graph',True))
+        try:
+            model = parse_method(fb.method, fb, c, d, device)
+            print("[INFO] Fallback parse_method creation succeeded with minimal args.")
+        except Exception as e2:
+            print(f"[ERROR] Fallback parse_method also failed: {e2}")
+            model = None
+
+    # If model available, attempt to load model_state
+    if model is not None:
+        try:
+            model_state = ckpt.get('model_state', None)
+            if model_state is not None:
+                model.load_state_dict(model_state)
+            else:
+                print("[WARN] checkpoint missing 'model_state' key.")
+        except Exception as e:
+            print(f"[WARN] failed loading model_state: {e}")
+
+        # Optionally evaluate predictions and write JSON summary
+        try:
+            # reconstruct an eval split if possible (best-effort)
+            # If dataset available, run evaluation
+            if 'dataset' in locals() and dataset is not None:
+                eval_func = eval_acc
+                split_idx = dataset.get_idx_split() if hasattr(dataset, 'get_idx_split') else None
+                res = evaluate(model, dataset, split_idx, eval_func, None, dargs)
+                # write results summary
+                out = {
+                    'ckpt_path': args.ckpt,
+                    'basename': os.path.basename(args.ckpt),
+                    'seed': getattr(dargs, 'seed', None),
+                    'exp_tag': getattr(dargs, 'exp_tag', None),
+                    'eval_result': res
+                }
+            else:
+                out = {'ckpt_path': args.ckpt, 'note': 'model created but dataset unavailable for eval'}
+        except Exception as e:
+            out = {'ckpt_path': args.ckpt, 'note': f'eval failed: {e}'}
+
+    else:
+        # No model; still save minimal info from checkpoint + pseudo_label_quality if any
+        out = {
+            'ckpt_path': args.ckpt,
+            'basename': os.path.basename(args.ckpt),
+            'seed': getattr(dargs, 'seed', None),
+            'exp_tag': getattr(dargs, 'exp_tag', None),
+            'note': 'model instantiation failed; see logs'
+        }
+
+    # save JSON under results/diagnosis_per_ckpt/
+    os.makedirs('results/diagnosis_per_ckpt', exist_ok=True)
+    base = os.path.basename(args.ckpt)
+    out_path = os.path.join('results/diagnosis_per_ckpt', f'diagnosis_{base}.json')
+    try:
+        with open(out_path, 'w') as f:
+            json.dump(out, f, indent=2)
+        print(f"[INFO] Wrote diagnosis JSON to {out_path}")
+    except Exception as e:
+        print(f"[ERROR] failed to write diagnosis JSON: {e}")
+
+if __name__ == '__main__':
+    main()
